@@ -29,7 +29,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 embed-resource = "3"
 iced = { version = "0.14", features = ["image", "tokio"] }
 windows = "0.62"
-windows-core = "0.62"
+windows-core = "0.100"
 
 [profile.release]
 lto = "thin"
