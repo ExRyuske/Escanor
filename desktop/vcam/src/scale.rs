@@ -102,7 +102,7 @@ pub fn scale_nv12(src: &[u8], sw: usize, sh: usize, dst: &mut Nv12Target) {
         let top = &src_uv[sy * sw..][..scw * 2];
         let bottom = &src_uv[sy1 * sw..][..scw * 2];
         let out = &mut uv_plane[(y0 / 2 + row) * pitch + x0..][..rcw * 2];
-        for (pair, &(sx, sx1, fx)) in out.chunks_exact_mut(2).zip(&xs) {
+        for (pair, &(sx, sx1, fx)) in out.as_chunks_mut::<2>().0.iter_mut().zip(&xs) {
             for c in 0..2 {
                 let t = lerp(top[sx * 2 + c], top[sx1 * 2 + c], fx);
                 let b = lerp(bottom[sx * 2 + c], bottom[sx1 * 2 + c], fx);

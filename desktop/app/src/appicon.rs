@@ -82,8 +82,8 @@ unsafe fn icon_to_rgba(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> 
             return None;
         }
         // BGRA → RGBA. У старых иконок без альфа-канала он весь нулевой — тогда они непрозрачны.
-        let opaque = pixels.chunks_exact(4).all(|p| p[3] == 0);
-        for p in pixels.chunks_exact_mut(4) {
+        let opaque = pixels.as_chunks::<4>().0.iter().all(|p| p[3] == 0);
+        for p in pixels.as_chunks_mut::<4>().0 {
             p.swap(0, 2);
             if opaque {
                 p[3] = 255;

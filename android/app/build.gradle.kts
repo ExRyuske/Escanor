@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 // Версия приложения — та же, что у программы на ПК (workspace.package в Cargo.toml).

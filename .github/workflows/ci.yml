@@ -42,7 +42,7 @@ env:
   # подряд — в CI такого не бывает, зато её промежуточные файлы раздувают кэш.
   CARGO_INCREMENTAL: "0"
   # Те же версии, что в android/app/build.gradle.kts.
-  ANDROID_PACKAGES: "platforms;android-35 build-tools;35.0.0 ndk;28.2.13676358 cmake;3.22.1"
+  ANDROID_PACKAGES: "platforms;android-35 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1"
 
 jobs:
   # Какая версия выпускается в этом прогоне. Здесь она только считается: коммит с

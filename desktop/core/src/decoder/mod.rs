@@ -81,7 +81,7 @@ impl Nv12Frame<'_> {
             let y_row = &self.y[sy * self.y_stride..];
             let uv_row = &self.uv[(sy / 2) * self.uv_stride..];
             let out = &mut rgba[py * pw * 4..][..pw * 4];
-            for (px, pixel) in out.chunks_exact_mut(4).enumerate() {
+            for (px, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let sx = px * step;
                 let c = (y_row[sx] as i32 - 16) * 298;
                 let d = uv_row[sx & !1] as i32 - 128;
