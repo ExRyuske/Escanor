@@ -1,0 +1,210 @@
+name: CI
+
+# Один workflow на всё: проверка веток-предложений, выпуск версии, сборка APK и
+# программы для Windows, публикация релиза — так же, как в YeruHost.
+#
+# Push в основную ветку выпускает версию сам. Не запускать прогон вовсе можно
+# строкой `[skip ci]` в сообщении коммита — её понимает сам GitHub. Правки одной
+# документации не запускают ничего. `minor` и `major` — Actions → CI → Run workflow.
+#
+# Релиз — то, что скачивает встроенное обновление Escanor: zip с программой, DLL
+# веб-камеры, APK и adb, и рядом файл .sha256, по которому пакет проверяется.
+on:
+  push:
+    branches: [main, master]
+    paths-ignore: ["**.md", "LICENSE", ".github/ISSUE_TEMPLATE/**"]
+  pull_request:
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Как повысить версию перед выпуском.
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+
+# По умолчанию токену дано только чтение; задача выпуска поднимает права себе сама.
+permissions:
+  contents: read
+
+# Ветку-предложение дописывают на ходу, и старый прогон уже никому не нужен.
+# Выпуск дорабатывает до конца: его пакеты нужны релизу целиком.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Отладочная информация в CI не нужна никому, а линковка с ней заметно дольше.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # Инкрементальная сборка рассчитана на повторную компиляцию того же дерева
+  # подряд — в CI такого не бывает, зато её промежуточные файлы раздувают кэш.
+  CARGO_INCREMENTAL: "0"
+  # Те же версии, что в android/app/build.gradle.kts.
+  ANDROID_PACKAGES: "platforms;android-35 build-tools;35.0.0 ndk;28.2.13676358 cmake;3.22.1"
+
+jobs:
+  # Какая версия выпускается в этом прогоне. Здесь она только считается: коммит с
+  # тегом делает `release`, когда собрано уже всё. Сорвавшаяся сборка не должна
+  # оставлять в истории тег, за которым ничего нет.
+  version:
+    name: version
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      sha: ${{ steps.head.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      # Остальные задачи берут ровно этот коммит, а не «вершину ветки» ещё раз:
+      # между их checkout'ами она успела бы уехать.
+      - id: head
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: bump
+        run: |
+          set -e
+          tag="$(python3 scripts/release.py bump --part '${{ inputs.bump || 'patch' }}' --dry-run | sed -n 's/.*-> \(v[0-9][0-9.]*\)$/\1/p')"
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # Приложение для телефона. Собирается отдельно на Linux: там Android SDK уже стоит,
+  # а готовый APK кладётся в пакет для Windows.
+  android:
+    name: Android
+    needs: version
+    if: ${{ !cancelled() && needs.version.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      # Версию APK Gradle берёт из Cargo.toml — поднимаем её до сборки.
+      - if: env.TAG != ''
+        run: |
+          set -e
+          got="$(python3 scripts/release.py bump --part '${{ inputs.bump || 'patch' }}' | sed -n 's/.*-> \(v[0-9][0-9.]*\)$/\1/p')"
+          test "$got" = "$TAG"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-read-only: ${{ github.ref_name != github.event.repository.default_branch }}
+      - run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" $ANDROID_PACKAGES > /dev/null
+      - working-directory: android
+        run: ./gradlew --no-daemon assembleRelease
+      - uses: actions/upload-artifact@v7
+        with:
+          name: escanor-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  # Программа для Windows: проверки, сборка и пакет с APK из задачи android.
+  windows:
+    name: Windows
+    needs: [version, android]
+    if: ${{ !cancelled() && needs.version.result != 'failure' && needs.android.result == 'success' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      # Версию поднимаем до сборки: программа сообщает о себе ту, что зашита в
+      # Cargo.toml при компиляции, и по ней же сравнивает релизы при обновлении.
+      - if: env.TAG != ''
+        shell: bash
+        run: |
+          set -e
+          got="$(python3 scripts/release.py bump --part '${{ inputs.bump || 'patch' }}' | sed -n 's/.*-> \(v[0-9][0-9.]*\)$/\1/p')"
+          test "$got" = "$TAG"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Пишет кэш только основная ветка: ветка-предложение и так читает его оттуда.
+          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+
+      # `--locked` тот же, что при выпуске: расхождение Cargo.lock должно
+      # ломаться на проверке, а не на сборке пакета.
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: escanor-apk
+          path: dist/android
+      - name: package
+        shell: bash
+        env:
+          APK: dist/android/app-release.apk
+        run: scripts/package.sh
+
+      # В предложении выгружать нечего: там сборка нужна как проверка.
+      - if: env.TAG != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: escanor-windows
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  release:
+    name: release
+    needs: [version, windows]
+    if: needs.version.outputs.tag != '' && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: escanor-windows
+          path: dist
+
+      # Пакеты собраны — теперь версию можно закреплять в истории. Push токеном
+      # GitHub Actions не запускает workflow заново — иначе выпуск выпускал бы сам
+      # себя по кругу. Если за время сборки в ветку что-то приехало, push упрётся в
+      # разошедшиеся истории — это лучше, чем тег на дереве, которого никто не собирал.
+      - run: |
+          set -e
+          got="$(python3 scripts/release.py bump --part '${{ inputs.bump || 'patch' }}' | sed -n 's/.*-> \(v[0-9][0-9.]*\)$/\1/p')"
+          test "$got" = "$TAG"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): $TAG"
+          git tag --annotate "$TAG" --message "Release $TAG"
+          git push origin HEAD:${{ github.ref_name }} "$TAG"
+
+      # Публикуем сразу: встроенное обновление берёт последний релиз.
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          draft: false
+          make_latest: true
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/*.zip.sha256

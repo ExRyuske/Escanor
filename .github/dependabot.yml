@@ -1,0 +1,53 @@
+# Обновления зависимостей — как в YeruHost.
+#
+# Раз в месяц и группами: каждое предложение здесь — полная сборка APK и
+# программы для Windows, поэтому лучше одно на экосистему, чем десяток по одному.
+# Уязвимости приходят мимо расписания: оповещения безопасности открывают
+# предложение сразу, как только выходит исправление.
+#
+# Префикс `chore(deps)` — потому что заголовки этих предложений попадают в
+# список изменений релиза, который GitHub собирает сам.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      # У крейтов версии 0.x ломающим является уже минорный выпуск. Интерфейс
+      # (iced), Windows API (windows) и звук (cpal) меняются заметно — их
+      # обновления приходят отдельными группами, чтобы было видно, что смотреть глазами.
+      ui:
+        patterns: ["iced*"]
+      windows:
+        patterns: ["windows*"]
+      audio:
+        patterns: ["cpal"]
+      crates:
+        patterns: ["*"]
+        exclude-patterns: ["iced*", "windows*", "cpal"]
+        update-types: [minor, patch]
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: gradle
+    directory: /android
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      android:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      actions:
+        patterns: ["*"]

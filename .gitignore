@@ -1,0 +1,17 @@
+# Сборка Rust и пакеты для релиза.
+/target
+/dist
+
+# Android: кэши Gradle, Kotlin и нативной сборки, путь к SDK на этой машине.
+android/.gradle
+android/.kotlin
+android/build
+android/app/build
+android/app/.cxx
+android/local.properties
+
+# Редакторы и системы.
+.idea/
+*.iml
+.vscode/
+.DS_Store
