@@ -14,6 +14,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use std::collections::VecDeque;
 use std::io::BufReader;
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,6 +49,27 @@ pub fn list_outputs() -> Vec<AudioOutputInfo> {
             Some(AudioOutputInfo { id, name })
         })
         .collect()
+}
+
+/// Устройство вывода по id из `list_outputs`; `None` — системное по умолчанию.
+pub(crate) fn find_output(device_id: Option<&str>) -> Result<cpal::Device> {
+    let host = cpal::default_host();
+    match device_id {
+        Some(id) => host
+            .output_devices()?
+            .find(|d| d.id().map(|i| i.to_string()).as_deref() == Ok(id))
+            .ok_or_else(|| anyhow!("устройство вывода не найдено")),
+        None => host.default_output_device().ok_or_else(|| anyhow!("нет устройства вывода")),
+    }
+}
+
+/// Ошибка, после которой поток вывода уже не заработает: устройство отключили или поток сброшен
+/// системой. Опустошения буфера и прочие временные сбои сюда не относятся.
+pub(crate) fn is_fatal(error: &cpal::Error) -> bool {
+    matches!(
+        error.kind(),
+        cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated | cpal::ErrorKind::HostUnavailable
+    )
 }
 
 /// Похоже ли устройство на виртуальный кабель — такие выбираются по умолчанию.
@@ -233,37 +255,40 @@ pub struct AudioOutput {
     thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
     _wasapi: Option<crate::wasapi::WasapiOutput>,
+    /// Поток cpal сообщил о неисправимой ошибке.
+    failed: Arc<AtomicBool>,
     /// Период устройства вывода, мс (если известен).
     pub period_ms: Option<f32>,
 }
 
 impl AudioOutput {
     pub fn start(device_id: Option<&str>, ring: SharedRing) -> Result<Self> {
-        let host = cpal::default_host();
-        let device = match device_id {
-            Some(id) => host
-                .output_devices()?
-                .find(|d| d.id().map(|i| i.to_string()).as_deref() == Ok(id))
-                .ok_or_else(|| anyhow!("устройство вывода не найдено"))?,
-            None => host.default_output_device().ok_or_else(|| anyhow!("нет устройства вывода"))?,
-        };
+        let device = find_output(device_id)?;
         #[cfg(windows)]
         {
             let endpoint = device.id().ok().map(|id| id.id().to_string());
             match crate::wasapi::WasapiOutput::start(endpoint, ring.clone()) {
                 Ok(output) => {
                     let period_ms = Some(output.period_ms);
-                    return Ok(Self { stop: None, thread: None, _wasapi: Some(output), period_ms });
+                    return Ok(Self {
+                        stop: None,
+                        thread: None,
+                        _wasapi: Some(output),
+                        failed: Arc::default(),
+                        period_ms,
+                    });
                 }
                 Err(e) => log::warn!("WASAPI с малым периодом недоступен, использую cpal: {e:#}"),
             }
         }
 
+        let failed = Arc::new(AtomicBool::new(false));
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let failed_flag = failed.clone();
         let thread =
             std::thread::Builder::new().name("escanor-audio-out".into()).spawn(move || {
-                match build_stream(&device, ring) {
+                match build_stream(&device, ring, failed_flag) {
                     Ok(stream) => {
                         let _ = ready_tx.send(Ok(()));
                         let _ = stop_rx.recv();
@@ -280,8 +305,18 @@ impl AudioOutput {
             thread: Some(thread),
             #[cfg(windows)]
             _wasapi: None,
+            failed,
             period_ms: None,
         })
+    }
+
+    /// Звук ещё выводится: устройство не отключили и поток не остановился с ошибкой.
+    pub fn is_alive(&self) -> bool {
+        #[cfg(windows)]
+        if let Some(wasapi) = &self._wasapi {
+            return wasapi.is_alive();
+        }
+        !self.failed.load(Ordering::Relaxed)
     }
 }
 
@@ -294,7 +329,7 @@ impl Drop for AudioOutput {
     }
 }
 
-fn build_stream(device: &cpal::Device, ring: SharedRing) -> Result<cpal::Stream> {
+fn build_stream(device: &cpal::Device, ring: SharedRing, failed: Arc<AtomicBool>) -> Result<cpal::Stream> {
     // Предпочитаем 48 кГц float — тогда передискретизация не нужна.
     let preferred =
         device.supported_output_configs()?.filter(|c| c.sample_format() == SampleFormat::F32).find_map(|c| {
@@ -313,10 +348,10 @@ fn build_stream(device: &cpal::Device, ring: SharedRing) -> Result<cpal::Stream>
         ring.lock().unwrap().set_output_period_ms(wanted as f32 * 1000.0 / config.sample_rate as f32);
     }
     let stream = match format {
-        SampleFormat::F32 => make_stream::<f32>(device, config, ring)?,
-        SampleFormat::I16 => make_stream::<i16>(device, config, ring)?,
-        SampleFormat::I32 => make_stream::<i32>(device, config, ring)?,
-        SampleFormat::U16 => make_stream::<u16>(device, config, ring)?,
+        SampleFormat::F32 => make_stream::<f32>(device, config, ring, failed)?,
+        SampleFormat::I16 => make_stream::<i16>(device, config, ring, failed)?,
+        SampleFormat::I32 => make_stream::<i32>(device, config, ring, failed)?,
+        SampleFormat::U16 => make_stream::<u16>(device, config, ring, failed)?,
         other => return Err(anyhow!("формат {other:?} не поддерживается")),
     };
     stream.play()?;
@@ -327,13 +362,19 @@ fn make_stream<T: SizedSample + FromSample<f32>>(
     device: &cpal::Device,
     config: StreamConfig,
     ring: SharedRing,
+    failed: Arc<AtomicBool>,
 ) -> Result<cpal::Stream> {
     let channels = config.channels as usize;
     let rate = config.sample_rate;
     let stream = device.build_output_stream(
         config,
         move |out: &mut [T], _| ring.lock().unwrap().render(out, channels, rate),
-        |e| log::warn!("ошибка вывода звука: {e}"),
+        move |e| {
+            log::warn!("ошибка вывода звука: {e}");
+            if is_fatal(&e) {
+                failed.store(true, Ordering::Relaxed);
+            }
+        },
         None,
     )?;
     Ok(stream)

@@ -13,6 +13,7 @@ use crate::protocol::{
     MacropadLayout, MacropadPage, MacropadState, PHONE_PORT, PhoneInfo, Request, Response, VERSION, VideoParams,
     VideoStarted,
 };
+use crate::soundpad::Soundpad;
 use crate::vcam::{self, FrameOutput, VcamStatus, VirtualCamera};
 use crate::video::{self, PreviewFrame, VideoCallbacks, VideoShared, VideoStats};
 use anyhow::{Context, Result, anyhow, bail};
@@ -50,6 +51,13 @@ pub enum Command {
     RefreshAudioOutputs,
     /// Раскладка макропада; `None` — выключить.
     SetMacropad(Option<PadLayout>),
+    /// Саундпад: устройство вывода звуков (`None` — по умолчанию), выравнивание громкости
+    /// и общая громкость (0..1).
+    SetSoundpad {
+        output: Option<String>,
+        normalize: bool,
+        volume: f32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -200,8 +208,13 @@ struct Engine {
     last_stats: Instant,
 
     macropad: Option<PadLayout>,
+    /// Что сейчас показывает телефон (`Some(None)` — макропад выключен); `None` — неизвестно,
+    /// например сразу после подключения. Раскладка уходит на телефон, только когда видимое там
+    /// изменилось: правка текста или звука кнопки не должна пересылать все картинки.
+    phone_macropad: Option<Option<MacropadLayout>>,
     /// Кнопки макропада, которые сейчас удерживаются (их клавиши нажаты на ПК).
     pad_held: Vec<(usize, usize)>,
+    soundpad: Soundpad,
 }
 
 impl Engine {
@@ -215,6 +228,7 @@ impl Engine {
             output: Arc::new(FrameOutput::default()),
             decoder: Mutex::new(None),
         });
+        let soundpad = Soundpad::new(events.clone());
         Self {
             events,
             tx,
@@ -244,7 +258,9 @@ impl Engine {
             last_adb_poll: None,
             last_stats: Instant::now(),
             macropad: None,
+            phone_macropad: None,
             pad_held: Vec::new(),
+            soundpad,
         }
     }
 
@@ -280,6 +296,14 @@ impl Engine {
         if self.last_stats.elapsed() >= Duration::from_secs(1) {
             self.report_stats();
             self.update_vcam_status();
+        }
+        self.soundpad.tick();
+        if self.audio_output.as_ref().is_some_and(|o| !o.is_alive()) {
+            // Устройство отключили (гарнитура, USB-карта): открываем заново — системное по умолчанию
+            // к этому моменту уже другое; если выбранного больше нет, покажем ошибку.
+            log::warn!("устройство вывода звука пропало, открываю заново");
+            self.audio_output = None;
+            self.ensure_audio_output();
         }
     }
 
@@ -385,9 +409,12 @@ impl Engine {
                     return;
                 }
                 self.release_pad_keys();
+                let sounds = layout.iter().flat_map(|l| &l.pages).flat_map(|p| &p.buttons);
+                self.soundpad.preload(sounds.filter_map(|b| b.sound.clone()).collect());
                 self.macropad = layout;
                 self.send_macropad();
             }
+            Command::SetSoundpad { output, normalize, volume } => self.soundpad.configure(output, normalize, volume),
         }
     }
 
@@ -598,6 +625,7 @@ impl Engine {
         self.epoch += 1;
         self.connecting = false;
         self.release_pad_keys();
+        self.phone_macropad = None;
         let Some(active) = self.active.take() else { return };
         for socket in &active.sockets {
             let _ = socket.shutdown(Shutdown::Both);
@@ -610,49 +638,17 @@ impl Engine {
     // --- Макропад ---
 
     fn send_macropad(&mut self) {
-        let Some(layout) = &self.macropad else {
-            self.send(Request::MacropadOff);
+        let message = self.macropad.as_ref().map(phone_layout);
+        if self.phone_macropad.as_ref() == Some(&message) {
             return;
-        };
-        let encode = |png: &Vec<u8>| base64::engine::general_purpose::STANDARD.encode(png);
-        let message = MacropadLayout {
-            columns: layout.columns,
-            rows: layout.rows,
-            orientation: layout.orientation,
-            amoled: layout.amoled,
-            pages: layout
-                .pages
-                .iter()
-                .map(|page| MacropadPage {
-                    parent: page.parent,
-                    buttons: page
-                        .buttons
-                        .iter()
-                        .map(|b| {
-                            let (kind, target) = match b.kind {
-                                PadKind::Keys => ("keys", None),
-                                PadKind::Folder(page) => ("folder", Some(page)),
-                                PadKind::Back => ("back", None),
-                            };
-                            MacropadButton {
-                                kind,
-                                target,
-                                states: b
-                                    .states
-                                    .iter()
-                                    .map(|s| MacropadState {
-                                        label: s.label.clone(),
-                                        image: s.image_png.as_ref().map(encode),
-                                    })
-                                    .collect(),
-                                state: b.state,
-                            }
-                        })
-                        .collect(),
-                })
-                .collect(),
-        };
-        self.send(Request::Macropad(message));
+        }
+        match &message {
+            Some(layout) => self.send(Request::Macropad(layout.clone())),
+            None => self.send(Request::MacropadOff),
+        }
+        if self.active.is_some() {
+            self.phone_macropad = Some(message);
+        }
     }
 
     /// Нажатие или отпускание кнопки на странице `page`. Папки и «Назад» телефон
@@ -664,6 +660,18 @@ impl Engine {
         }
         if let Some(target) = button.launch.clone() {
             if down && let Err(e) = crate::launcher::launch(&target) {
+                self.emit(Event::Error(format!("Макропад: {e:#}")));
+            }
+            return;
+        }
+        if let Some(sound) = &button.sound {
+            if down {
+                self.soundpad.toggle(sound);
+            }
+            return;
+        }
+        if let Some(text) = &button.text {
+            if down && let Err(e) = keys::type_text(text) {
                 self.emit(Event::Error(format!("Макропад: {e:#}")));
             }
             return;
@@ -682,6 +690,12 @@ impl Engine {
                 keys::send(&combo, true).and_then(|_| keys::send(&combo, false))
             };
             self.send(Request::MacropadState { page, id: index as u32, state });
+            // Телефон уже знает новое состояние: эхо раскладки от интерфейса не должно пересылать её целиком.
+            if let Some(Some(layout)) = &mut self.phone_macropad
+                && let Some(b) = layout.pages.get_mut(page).and_then(|p| p.buttons.get_mut(index))
+            {
+                b.state = state;
+            }
             self.emit(Event::MacropadState { page, id: index, state });
             if let Err(e) = result {
                 self.emit(Event::Error(format!("Макропад: {e:#}")));
@@ -805,6 +819,48 @@ impl Engine {
     }
 }
 
+/// Раскладка в том виде, в каком её получает телефон: только то, что он показывает.
+fn phone_layout(layout: &PadLayout) -> MacropadLayout {
+    let encode = |png: &Vec<u8>| base64::engine::general_purpose::STANDARD.encode(png);
+    MacropadLayout {
+        columns: layout.columns,
+        rows: layout.rows,
+        orientation: layout.orientation,
+        amoled: layout.amoled,
+        pages: layout
+            .pages
+            .iter()
+            .map(|page| MacropadPage {
+                parent: page.parent,
+                buttons: page
+                    .buttons
+                    .iter()
+                    .map(|b| {
+                        let (kind, target) = match b.kind {
+                            PadKind::Keys => ("keys", None),
+                            PadKind::Folder(page) => ("folder", Some(page)),
+                            PadKind::Back => ("back", None),
+                        };
+                        MacropadButton {
+                            kind,
+                            target,
+                            states: b
+                                .states
+                                .iter()
+                                .map(|s| MacropadState {
+                                    label: s.label.clone(),
+                                    image: s.image_png.as_ref().map(encode),
+                                })
+                                .collect(),
+                            state: b.state,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 // --- Рукопожатие (в отдельном потоке) ---
 
 fn connect(adb: &Adb, serial: &str, progress: &dyn Fn(&str)) -> Result<Connection> {
@@ -905,5 +961,35 @@ fn handshake() -> Result<(TcpStream, BufReader<TcpStream>, u32, PhoneInfo)> {
     match serde_json::from_str::<Response>(&line)? {
         Response::Hello { version, phone } => Ok((control, reader, version, phone)),
         other => bail!("неожиданный ответ: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::macropad::{PadButton, PadPage, PadState};
+
+    #[test]
+    fn phone_layout_ignores_what_phone_does_not_show() {
+        let button = |text: Option<&str>| PadButton {
+            kind: PadKind::Keys,
+            toggle: false,
+            keys: Default::default(),
+            launch: None,
+            text: text.map(str::to_string),
+            sound: None,
+            states: vec![PadState { label: "A".into(), image_png: Some(vec![1, 2, 3]) }],
+            state: 0,
+        };
+        let layout = |text| PadLayout {
+            columns: 1,
+            rows: 1,
+            orientation: Default::default(),
+            amoled: Default::default(),
+            pages: vec![PadPage { parent: None, buttons: vec![button(text)] }],
+        };
+        let before = phone_layout(&layout(Some("при")));
+        assert_eq!(before, phone_layout(&layout(Some("привет"))), "правка текста не пересылает раскладку");
+        assert_eq!(before.pages[0].buttons[0].states[0].image.as_deref(), Some("AQID"));
     }
 }

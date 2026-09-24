@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
@@ -187,18 +188,21 @@ class MainActivity : Activity() {
     }
 
     private fun padButton(page: Int, index: Int, button: Macropad.Button): Cell {
+        val stroke = (2 * density).toInt().coerceAtLeast(1)
+        val shape = GradientDrawable().apply {
+            cornerRadius = 18 * density
+            setColor(AMOLED_FILL)
+            setStroke(stroke, AMOLED_STROKE)
+        }
         val cell = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                cornerRadius = 18 * density
-                setColor(AMOLED_FILL)
-                setStroke(density.toInt().coerceAtLeast(1), AMOLED_STROKE)
-            }
+            background = shape
             clipToOutline = true
             isHapticFeedbackEnabled = true
         }
         val image = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
         val label = TextView(this).apply {
             setTextColor(AMOLED_TEXT)
+            typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
             maxLines = 2
         }
@@ -211,7 +215,8 @@ class MainActivity : Activity() {
                 MotionEvent.ACTION_DOWN -> {
                     v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                     v.animate().scaleX(0.94f).scaleY(0.94f).setDuration(60).start()
-                    v.background.alpha = 160
+                    shape.setColor(AMOLED_PRESSED)
+                    shape.setStroke(stroke, ACCENT)
                     when (button.kind) {
                         // Папки и «Назад» открываются сразу, без обращения к ПК.
                         "folder" -> Macropad.open(button.target)
@@ -224,7 +229,8 @@ class MainActivity : Activity() {
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     v.animate().scaleX(1f).scaleY(1f).setDuration(90).start()
-                    v.background.alpha = 255
+                    shape.setColor(AMOLED_FILL)
+                    shape.setStroke(stroke, AMOLED_STROKE)
                     if (held.remove(index)) Macropad.press(page, index, false)
                 }
             }
@@ -257,7 +263,7 @@ class MainActivity : Activity() {
         }
         cell.label.text = text
         cell.label.visibility = if (text.isNotEmpty()) View.VISIBLE else View.GONE
-        cell.label.setTextSize(TypedValue.COMPLEX_UNIT_SP, if (bitmap == null) 20f else 13f)
+        cell.label.setTextSize(TypedValue.COMPLEX_UNIT_SP, if (bitmap == null) 20f else 15f)
         cell.label.layoutParams = FrameLayout.LayoutParams(-1, if (bitmap == null) -1 else -2).apply {
             gravity = Gravity.BOTTOM
             bottomMargin = inset / 2
@@ -341,9 +347,11 @@ class MainActivity : Activity() {
         private val TEXT = Color.rgb(0xE8, 0xEA, 0xED)
         private val MUTED = Color.rgb(0x8B, 0x93, 0xA1)
 
-        // AMOLED: чёрные пиксели не светятся — не изнашиваются и не тратят батарею.
+        // AMOLED: чёрная заливка не светится, а заметная рамка и светлая подпись
+        // отделяют кнопки от фона.
         private val AMOLED_FILL = Color.BLACK
-        private val AMOLED_STROKE = Color.rgb(0x1C, 0x1C, 0x22)
-        private val AMOLED_TEXT = Color.rgb(0xB8, 0xBC, 0xC4)
+        private val AMOLED_PRESSED = Color.rgb(0x2A, 0x1F, 0x4A)
+        private val AMOLED_STROKE = Color.rgb(0x4A, 0x4D, 0x5A)
+        private val AMOLED_TEXT = Color.rgb(0xF2, 0xF3, 0xF5)
     }
 }

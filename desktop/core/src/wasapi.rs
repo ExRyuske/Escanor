@@ -41,6 +41,13 @@ impl WasapiOutput {
     }
 }
 
+impl WasapiOutput {
+    /// Поток вывода работает; он завершается с ошибкой, например когда устройство отключили.
+    pub fn is_alive(&self) -> bool {
+        self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+}
+
 impl Drop for WasapiOutput {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);

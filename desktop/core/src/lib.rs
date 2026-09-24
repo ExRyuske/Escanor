@@ -9,6 +9,7 @@ pub mod keys;
 pub mod launcher;
 pub mod macropad;
 pub mod protocol;
+pub mod soundpad;
 pub mod vcam;
 pub mod video;
 #[cfg(windows)]

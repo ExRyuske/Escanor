@@ -239,3 +239,16 @@ pub fn input(_: &Theme, status: iced::widget::text_input::Status) -> iced::widge
         selection: alpha(ACCENT, 0.45),
     }
 }
+
+/// Многострочное поле — как однострочное.
+pub fn editor(_: &Theme, status: iced::widget::text_editor::Status) -> iced::widget::text_editor::Style {
+    use iced::widget::text_editor::Status;
+    let focused = matches!(status, Status::Focused { .. } | Status::Hovered);
+    iced::widget::text_editor::Style {
+        background: Background::Color(BG),
+        border: border::rounded(RADIUS).width(1).color(if focused { ACCENT } else { BORDER }),
+        placeholder: MUTED,
+        value: TEXT,
+        selection: alpha(ACCENT, 0.45),
+    }
+}

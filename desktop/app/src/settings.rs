@@ -86,6 +86,12 @@ pub struct MacropadSettings {
     /// Затемнение экрана телефона при бездействии (AMOLED-режим включён всегда).
     pub amoled: Amoled,
     pub buttons: Vec<ButtonSettings>,
+    /// Устройство вывода для звуков саундпада; `None` — системное по умолчанию.
+    pub sound_output: Option<String>,
+    /// Выравнивать громкость звуков саундпада.
+    pub normalize_sounds: bool,
+    /// Общая громкость саундпада, %.
+    pub sound_volume: u32,
 }
 
 impl Default for MacropadSettings {
@@ -97,6 +103,9 @@ impl Default for MacropadSettings {
             orientation: Orientation::default(),
             amoled: Amoled::default(),
             buttons: Vec::new(),
+            sound_output: None,
+            normalize_sounds: true,
+            sound_volume: 100,
         };
         pad.resize();
         pad
@@ -128,6 +137,12 @@ impl MacropadSettings {
     /// Имена всех картинок, на которые ссылаются кнопки, включая кнопки в папках.
     pub fn images(&self) -> Vec<&str> {
         self.all_buttons().into_iter().flat_map(|b| &b.states).filter_map(|s| s.image.as_deref()).collect()
+    }
+
+    /// Имена всех звуков кнопок, включая кнопки в папках. Звук кнопки, которая на время стала
+    /// другого типа, тоже считается: он вернётся вместе с типом.
+    pub fn sounds(&self) -> Vec<&str> {
+        self.all_buttons().into_iter().map(|b| b.sound_file.as_str()).filter(|f| !f.is_empty()).collect()
     }
 
     /// Кнопки страницы по пути из номеров папок (пустой путь — корень).
@@ -173,6 +188,13 @@ pub struct ButtonSettings {
     /// Программа: касание открывает `target` — exe, ярлык, файл или адрес сайта.
     pub launch: bool,
     pub target: String,
+    /// Текст: касание печатает `snippet` на ПК, с `enter` — и нажимает Enter в конце.
+    pub text: bool,
+    pub snippet: String,
+    pub enter: bool,
+    /// Звук: касание проигрывает на ПК файл `sound_file` из папки макропада.
+    pub sound: bool,
+    pub sound_file: String,
 }
 
 impl Default for ButtonSettings {
@@ -186,6 +208,11 @@ impl Default for ButtonSettings {
             children: Vec::new(),
             launch: false,
             target: String::new(),
+            text: false,
+            snippet: String::new(),
+            enter: false,
+            sound: false,
+            sound_file: String::new(),
         };
         button.normalize();
         button
@@ -193,14 +220,16 @@ impl Default for ButtonSettings {
 }
 
 impl ButtonSettings {
-    /// Приводит в согласованный вид: всегда два состояния, у папки и программы нет переключателя.
+    /// Приводит в согласованный вид: всегда два состояния, у папки, программы, текста и звука нет переключателя.
     fn normalize(&mut self) {
         self.states.resize(TOGGLE_STATES, StateSettings::default());
-        if self.folder || self.launch {
+        if self.folder || self.launch || self.text || self.sound {
             self.toggle = false;
         }
         if self.folder {
             self.launch = false;
+            self.text = false;
+            self.sound = false;
         }
         if !self.toggle || self.state >= TOGGLE_STATES {
             self.state = 0;
@@ -211,6 +240,8 @@ impl ButtonSettings {
     pub fn is_empty(&self) -> bool {
         !self.folder
             && !self.launch
+            && !self.text
+            && !self.sound
             && self.keys.is_empty()
             && self.states.iter().all(|s| s.label.is_empty() && s.image.is_none())
     }
@@ -304,9 +335,30 @@ pub fn import_image(source: &Path) -> Result<String> {
 pub fn save_image(image: impl Into<image::DynamicImage>) -> Result<String> {
     let image = image.into().thumbnail(IMAGE_SIZE, IMAGE_SIZE);
     std::fs::create_dir_all(images_dir())?;
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-    let name = format!("{stamp}.png");
+    let name = new_file_name("png");
     image.save_with_format(images_dir().join(&name), image::ImageFormat::Png)?;
+    Ok(name)
+}
+
+/// Свободное имя файла в папке макропада. Метка времени может совпасть, если за одну
+/// миллисекунду добавлено несколько файлов (перетащили сразу несколько) — тогда с номером.
+fn new_file_name(ext: &str) -> String {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    (0..)
+        .map(|i| if i == 0 { format!("{stamp}.{ext}") } else { format!("{stamp}-{i}.{ext}") })
+        .find(|name| !images_dir().join(name).exists())
+        .expect("бесконечная последовательность имён")
+}
+
+/// Копирует звук в папку макропада — как картинки, он не зависит от того, где лежал исходный файл.
+pub fn save_sound(source: &Path) -> Result<String> {
+    let ext = source.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let name = new_file_name(&ext);
+    // Тесты гоняют App::update — настоящую папку при этом трогать нельзя.
+    if !cfg!(test) {
+        std::fs::create_dir_all(images_dir())?;
+        std::fs::copy(source, images_dir().join(&name))?;
+    }
     Ok(name)
 }
 
@@ -325,9 +377,12 @@ pub fn render_image(name: &str, tint: Option<[u8; 3]>) -> Option<Vec<u8>> {
     Some(png)
 }
 
-/// Удаляет копии картинок, на которые больше не ссылается ни одна кнопка.
-pub fn remove_unused_images(pad: &MacropadSettings) {
-    let used = pad.images();
+/// Удаляет копии картинок и звуков, на которые больше не ссылается ни одна кнопка.
+pub fn remove_unused_files(pad: &MacropadSettings) {
+    if cfg!(test) {
+        return;
+    }
+    let used = [pad.images(), pad.sounds()].concat();
     let Ok(entries) = std::fs::read_dir(images_dir()) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -384,5 +439,17 @@ mod tests {
         assert_eq!(pad.buttons[2].children.len(), 4, "папка следует размеру сетки");
         assert_eq!(pad.images(), ["inside.png"], "картинки из папок не считаются лишними");
         assert_eq!(pad.page(&[2])[3].states[0].image.as_deref(), Some("inside.png"));
+    }
+
+    #[test]
+    fn sounds_are_kept_even_if_button_changed_kind() {
+        let mut pad = MacropadSettings::default();
+        pad.buttons[0].sound = true;
+        pad.buttons[0].sound_file = "1.mp3".into();
+        pad.buttons[1].sound_file = "2.wav".into();
+        pad.buttons[2].folder = true;
+        pad.resize();
+        pad.buttons[2].children[1].sound_file = "3.ogg".into();
+        assert_eq!(pad.sounds(), ["1.mp3", "2.wav", "3.ogg"]);
     }
 }

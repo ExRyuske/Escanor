@@ -13,7 +13,7 @@ use escanor_core::vcam::VcamStatus;
 use iced::font::Weight;
 use iced::widget::{
     Column, PickList, Row, Toggler, button, column, container, image, mouse_area, pick_list, row, rule, scrollable,
-    slider, space, text, text_input, toggler, tooltip,
+    slider, space, text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{Alignment, Color, ContentFit, Element, Font, Length, Theme, border};
 
@@ -562,7 +562,7 @@ fn macropad_view(app: &App) -> Element<'_, Message> {
     crumbs = crumbs.push(info(
         "Перетаскивайте кнопки мышью: на другую — поменять местами, на папку — положить внутрь, \
          на «← Назад» — перенести на уровень выше. Папка открывается двойным щелчком. \
-         Программу можно перетащить из Проводника прямо на ячейку.",
+         Программу или звук можно перетащить из Проводника прямо на ячейку.",
     ));
 
     let page = app.pad_page();
@@ -580,7 +580,31 @@ fn macropad_view(app: &App) -> Element<'_, Message> {
     // Отпустили мышь мимо ячеек или увели курсор с сетки — перетаскивание отменяется.
     let grid = mouse_area(grid).on_release(Message::PadDragCancel).on_exit(Message::PadDragCancel);
 
-    let main = column![panel(toolbar), crumbs, container(grid).center_x(Length::Fill),].spacing(20).padding(24);
+    let sounds = column![
+        titled(
+            "Звуки",
+            "Кнопки «Звук» проигрывают файлы на этом ПК. Чтобы их слышали собеседники, выберите виртуальный \
+             кабель, который в Discord или игре выбран микрофоном.",
+        ),
+        select(app.output_choices(), Some(app.sound_output()), Message::PadSoundOutput),
+        row![
+            text("Громкость").size(SMALL).style(style::muted),
+            slider(0..=100, pad.sound_volume, Message::PadSoundVolume),
+            text(format!("{} %", pad.sound_volume)).size(SMALL).width(44),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+        row![
+            switch("Выравнивать громкость", pad.normalize_sounds, Message::PadNormalize),
+            info("Громкие звуки становятся тише, тихие — громче, чтобы все звучали примерно одинаково."),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(12);
+
+    let main =
+        column![panel(toolbar), panel(sounds), crumbs, container(grid).center_x(Length::Fill),].spacing(20).padding(24);
 
     row![
         scrollable(main).width(Length::Fill).height(Length::Fill),
@@ -612,6 +636,8 @@ fn pad_cell(app: &App, index: usize) -> Element<'_, Message> {
             Some(None) => content = content.push(text("нет файла").size(12).style(style::bad)),
             None if b.folder => content = content.push(text("▤").size(26).style(style::accent)),
             None if b.launch => content = content.push(text("▶").size(24).style(style::accent)),
+            None if b.text => content = content.push(text("¶").size(24).style(style::accent)),
+            None if b.sound => content = content.push(text("♪").size(24).style(style::accent)),
             None => {}
         }
         if !state.label.is_empty() {
@@ -620,6 +646,10 @@ fn pad_cell(app: &App, index: usize) -> Element<'_, Message> {
             content = content.push(text("Папка").size(12).style(style::muted));
         } else if b.launch && state.image.is_none() {
             content = content.push(text("Программа").size(12).style(style::muted));
+        } else if b.text && state.image.is_none() {
+            content = content.push(text("Текст").size(12).style(style::muted));
+        } else if b.sound && state.image.is_none() {
+            content = content.push(text("Звук").size(12).style(style::muted));
         } else if state.image.is_none() && !b.keys.is_empty() {
             content = content.push(text(b.keys.to_string()).size(12).center().style(style::muted));
         } else if state.image.is_none() {
@@ -724,6 +754,10 @@ fn button_editor(app: &App) -> Element<'_, Message> {
         "Нажатие на телефоне открывает страницу с кнопками папки; первая ячейка в ней — «← Назад»."
     } else if b.launch {
         "Касание открывает программу, файл или сайт — как двойной щелчок в Проводнике."
+    } else if b.sound {
+        "Касание проигрывает звук на ПК в устройство, выбранное в блоке «Звуки»; повторное — останавливает."
+    } else if b.text {
+        "Касание печатает заготовленный текст в активное окно на ПК — как будто его набрали с клавиатуры."
     } else if b.toggle {
         "Нажатие отправляет сочетание и переключает кнопку на другое состояние — со своей картинкой и подписью."
     } else {
@@ -736,12 +770,18 @@ fn button_editor(app: &App) -> Element<'_, Message> {
                 (ButtonKind::Normal, "Клавиши"),
                 (ButtonKind::Toggle, "Вкл/выкл"),
                 (ButtonKind::App, "Программа"),
+                (ButtonKind::Text, "Текст"),
+                (ButtonKind::Sound, "Звук"),
                 (ButtonKind::Folder, "Папка"),
             ],
             if b.folder {
                 ButtonKind::Folder
             } else if b.launch {
                 ButtonKind::App
+            } else if b.text {
+                ButtonKind::Text
+            } else if b.sound {
+                ButtonKind::Sound
             } else if b.toggle {
                 ButtonKind::Toggle
             } else {
@@ -848,6 +888,52 @@ fn button_editor(app: &App) -> Element<'_, Message> {
         ]
         .spacing(12);
         return column![panel(kind), panel(look), panel(target)].spacing(14).into();
+    }
+
+    if b.text {
+        let snippet = column![
+            titled(
+                "Что печатать",
+                "Текст печатается в окно, где сейчас курсор, — с любыми символами и эмодзи, при любой раскладке. \
+                 Каждый перевод строки нажимает Enter.",
+            ),
+            text_editor(&app.snippet_editor)
+                .placeholder("Например: Всем привет!")
+                .style(style::editor)
+                .on_action(Message::PadSnippet)
+                .height(96)
+                .size(14),
+            switch("Нажать Enter в конце", b.enter, Message::PadEnter),
+        ]
+        .spacing(12);
+        return column![panel(kind), panel(look), panel(snippet)].spacing(14).into();
+    }
+
+    if b.sound {
+        let (status, pick): (Element<'_, Message>, _) = if b.sound_file.is_empty() {
+            (hint("Звук не выбран."), "Выбрать звук…")
+        } else if app.sound_exists(&b.sound_file) {
+            (text("♪ Звук сохранён в папке программы").size(SMALL).style(style::ok).into(), "Заменить…")
+        } else {
+            (
+                text("Файл звука удалён из папки программы — выберите его заново.")
+                    .size(SMALL)
+                    .style(style::bad)
+                    .into(),
+                "Выбрать звук…",
+            )
+        };
+        let sound = column![
+            titled(
+                "Какой звук",
+                "mp3, wav, ogg или flac. Звук копируется в папку программы, как картинки. Его можно просто \
+                 перетащить из Проводника на ячейку сетки.",
+            ),
+            status,
+            button(text(pick).size(SMALL)).style(style::btn).on_press(Message::PadPickSound),
+        ]
+        .spacing(12);
+        return column![panel(kind), panel(look), panel(sound)].spacing(14).into();
     }
 
     // Что нажимается на ПК.

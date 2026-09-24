@@ -64,6 +64,10 @@ pub struct PadButton {
     pub keys: KeyCombo,
     /// Программа, файл или ссылка: открывается касанием вместо нажатия клавиш.
     pub launch: Option<String>,
+    /// Заготовленный текст: касание печатает его на ПК вместо нажатия клавиш.
+    pub text: Option<String>,
+    /// Звуковой файл: касание проигрывает его на ПК (саундпад).
+    pub sound: Option<String>,
     /// Одно состояние у обычной кнопки и папки, два — у переключателя.
     pub states: Vec<PadState>,
     pub state: usize,

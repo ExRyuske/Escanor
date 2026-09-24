@@ -13,11 +13,23 @@ use escanor_core::protocol::{
 };
 use escanor_core::vcam::VcamStatus;
 use escanor_core::{Command, EngineHandle, Event, Stats};
-use iced::widget::image;
+use iced::widget::{image, text_editor};
 use iced::{Task, window};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+
+/// Звуковые файлы, которые умеет саундпад.
+const SOUND_EXTENSIONS: [&str; 5] = ["mp3", "wav", "ogg", "flac", "oga"];
+
+fn is_sound(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| SOUND_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+}
+
+/// Полный путь к звуку из папки макропада.
+fn sound_path(name: &str) -> String {
+    settings::images_dir().join(name).to_string_lossy().into_owned()
+}
 
 pub const BITRATES: [u32; 6] = [6, 10, 16, 24, 32, 48];
 /// 60 к/с вдвое сокращают время кадра на всём пути: сенсор, конвейер камеры, кодировщик.
@@ -99,6 +111,18 @@ pub enum Message {
     PadAppIcon,
     /// Путь или адрес для кнопки-программы.
     PadTarget(String),
+    /// Правка текста кнопки-текста.
+    PadSnippet(text_editor::Action),
+    /// Нажимать Enter после текста.
+    PadEnter(bool),
+    /// Файл для кнопки-звука.
+    PadPickSound,
+    PadSoundPicked(Option<PathBuf>),
+    /// Устройство вывода звуков саундпада.
+    PadSoundOutput(OutputChoice),
+    PadNormalize(bool),
+    /// Общая громкость саундпада, %.
+    PadSoundVolume(u32),
     PadPickApp,
     PadAppPicked(Option<PathBuf>),
     /// Файл, перетащенный на окно из Проводника: становится кнопкой-программой.
@@ -135,6 +159,8 @@ pub enum ButtonKind {
     Toggle,
     Folder,
     App,
+    Text,
+    Sound,
 }
 
 /// Через сколько приглушать экран телефона в режиме AMOLED.
@@ -251,6 +277,8 @@ pub struct App {
     open_panels: Vec<Panel>,
     /// Текст поля HEX-цвета (пока вводится, может быть неполным).
     pub tint_input: String,
+    /// Многострочное поле текста выбранной кнопки-текста.
+    pub snippet_editor: text_editor::Content,
     /// Готовые картинки: (файл, цвет) → PNG и дескриптор для превью; `None` — файла нет.
     pad_images: HashMap<ImageKey, Option<(Vec<u8>, image::Handle)>>,
     /// Звук ещё не включали вручную — включим сами, если найдётся виртуальный кабель.
@@ -291,7 +319,7 @@ impl App {
             physical,
         });
         let resolution = saved.resolution.map(|(width, height)| ResolutionChoice { width, height, max_fps: 0 });
-        Self {
+        let mut app = Self {
             engine: None,
             adb_devices: Vec::new(),
             adb_error: None,
@@ -339,6 +367,7 @@ impl App {
             record_modifiers: iced::keyboard::Modifiers::default(),
             open_panels: Vec::new(),
             tint_input: String::new(),
+            snippet_editor: text_editor::Content::new(),
             pad_images: HashMap::new(),
             audio_auto: saved.audio_enabled.is_none(),
             close_to_tray: saved.close_to_tray,
@@ -349,7 +378,11 @@ impl App {
             window: None,
             hidden: false,
             saved,
-        }
+        };
+        // Поля редактора — под кнопку, выбранную при запуске: иначе первая правка пустого
+        // поля затёрла бы её сохранённый текст.
+        app.sync_inputs();
+        app
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -365,6 +398,17 @@ impl App {
                     dialog.add_filter("Все файлы", &["*"]).pick_file().await.map(|f| f.path().to_path_buf())
                 },
                 Message::PadAppPicked,
+            ),
+            Message::PadPickSound => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Звук для кнопки")
+                        .add_filter("Звуки", &SOUND_EXTENSIONS)
+                        .pick_file()
+                        .await
+                        .map(|f| f.path().to_path_buf())
+                },
+                Message::PadSoundPicked,
             ),
             Message::PadPickImage => Task::perform(
                 async {
@@ -644,6 +688,40 @@ impl App {
                 }
                 self.apply_pad();
             }
+            Message::PadSnippet(action) => {
+                let edit = action.is_edit();
+                self.snippet_editor.perform(action);
+                if edit {
+                    let snippet = self.snippet_editor.text();
+                    if let Some(b) = self.selected_button_mut() {
+                        b.snippet = snippet;
+                    }
+                    self.apply_pad();
+                }
+            }
+            Message::PadEnter(on) => {
+                if let Some(b) = self.selected_button_mut() {
+                    b.enter = on;
+                }
+                self.apply_pad();
+            }
+            Message::PadSoundPicked(Some(path)) => {
+                let index = self.pad_selected;
+                self.set_sound(index, &path);
+            }
+            Message::PadSoundPicked(None) | Message::PadPickSound => {}
+            Message::PadSoundOutput(choice) => {
+                self.pad.sound_output = choice.id;
+                self.apply_soundpad();
+            }
+            Message::PadNormalize(on) => {
+                self.pad.normalize_sounds = on;
+                self.apply_soundpad();
+            }
+            Message::PadSoundVolume(percent) => {
+                self.pad.sound_volume = percent;
+                self.apply_soundpad();
+            }
             Message::PadAppPicked(Some(path)) => {
                 let index = self.pad_selected;
                 self.set_app(index, &path);
@@ -658,9 +736,12 @@ impl App {
                         .filter(|&i| !self.is_back(i))
                         .or_else(|| (first..self.pad_page().len()).find(|&i| self.pad_page()[i].is_empty()));
                     match target {
+                        Some(index) if is_sound(&path) => self.set_sound(index, &path),
                         Some(index) => self.set_app(index, &path),
                         None => self.error = Some("Макропад: на странице нет свободных ячеек".into()),
                     }
+                    // Несколько файлов приходят по одному: следующие — в свободные ячейки, а не поверх этого.
+                    self.pad_hover = None;
                 }
             }
             Message::PadDragCancel => {
@@ -674,6 +755,8 @@ impl App {
                     b.toggle = kind == ButtonKind::Toggle;
                     b.folder = kind == ButtonKind::Folder;
                     b.launch = kind == ButtonKind::App;
+                    b.text = kind == ButtonKind::Text;
+                    b.sound = kind == ButtonKind::Sound;
                     b.state = 0;
                     // Содержимое папки не теряется, если она на время станет обычной кнопкой.
                     if b.folder {
@@ -681,19 +764,19 @@ impl App {
                     }
                 }
                 self.pad.resize();
-                self.sync_tint_input();
+                self.sync_inputs();
                 self.apply_pad();
             }
             Message::PadState(index) => {
                 if let Some(b) = self.selected_button_mut() {
                     b.state = index.min(TOGGLE_STATES - 1);
                 }
-                self.sync_tint_input();
+                self.sync_inputs();
                 self.apply_pad();
             }
             Message::PadTint(tint) => {
                 self.edit_state(|s| s.tint = tint);
-                self.sync_tint_input();
+                self.sync_inputs();
             }
             Message::PadTintHex(value) => {
                 if let Some(tint) = parse_hex(&value) {
@@ -748,7 +831,32 @@ impl App {
             ae_lock: Some(self.ae_lock),
             awb_lock: Some(self.awb_lock),
         }));
+        self.apply_soundpad();
         self.apply_pad();
+    }
+
+    fn apply_soundpad(&self) {
+        // Слух воспринимает громкость логарифмически: квадрат делает ползунок равномерным на слух.
+        let volume = (self.pad.sound_volume.min(100) as f32 / 100.0).powi(2);
+        self.send(Command::SetSoundpad {
+            output: self.pad.sound_output.clone(),
+            normalize: self.pad.normalize_sounds,
+            volume,
+        });
+    }
+
+    pub fn sound_exists(&self, name: &str) -> bool {
+        settings::images_dir().join(name).is_file()
+    }
+
+    /// Устройство звуков саундпада для списка выбора.
+    pub fn sound_output(&self) -> OutputChoice {
+        let choices = self.output_choices();
+        choices
+            .iter()
+            .find(|c| c.id == self.pad.sound_output)
+            .cloned()
+            .unwrap_or_else(|| OutputChoice { id: self.pad.sound_output.clone(), name: "…".into() })
     }
 
     fn set_hidden(&mut self, hidden: bool) {
@@ -860,7 +968,7 @@ impl App {
     fn select(&mut self, index: usize) {
         self.pad_selected = index;
         self.recording = false;
-        self.sync_tint_input();
+        self.sync_inputs();
     }
 
     /// Делает кнопку `index` открытой страницы кнопкой программы: подпись — имя файла,
@@ -888,6 +996,36 @@ impl App {
             b.states[0].tint = None;
         }
         self.select(index);
+        self.apply_pad();
+    }
+
+    /// Делает кнопку `index` открытой страницы кнопкой-звуком: файл копируется в папку макропада,
+    /// подпись — имя файла.
+    fn set_sound(&mut self, index: usize, path: &std::path::Path) {
+        if self.is_back(index) {
+            return;
+        }
+        let name = match settings::save_sound(path) {
+            Ok(name) => name,
+            Err(e) => {
+                self.error = Some(format!("Звук: {e:#}"));
+                return;
+            }
+        };
+        let path_page = self.pad_path.clone();
+        let Some(b) = self.pad.page_mut(&path_page).get_mut(index) else { return };
+        b.sound = true;
+        b.launch = false;
+        b.text = false;
+        b.folder = false;
+        b.toggle = false;
+        b.state = 0;
+        b.sound_file = name;
+        if b.states[0].label.is_empty() {
+            b.states[0].label = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        }
+        self.select(index);
+        settings::remove_unused_files(&self.pad);
         self.apply_pad();
     }
 
@@ -924,7 +1062,7 @@ impl App {
                 self.pad_selected = target;
             }
         }
-        self.sync_tint_input();
+        self.sync_inputs();
         self.apply_pad();
     }
 
@@ -934,8 +1072,8 @@ impl App {
             s.image = image;
             s.tint = None;
         });
-        self.sync_tint_input();
-        settings::remove_unused_images(&self.pad);
+        self.sync_inputs();
+        settings::remove_unused_files(&self.pad);
     }
 
     /// Какое состояние выбранной кнопки сейчас редактируется: у переключателя — текущее.
@@ -955,7 +1093,10 @@ impl App {
         self.apply_pad();
     }
 
-    fn sync_tint_input(&mut self) {
+    /// Поля ввода редактора кнопки — под выбранную кнопку.
+    fn sync_inputs(&mut self) {
+        self.snippet_editor =
+            text_editor::Content::with_text(self.selected_button().map_or("", |b| b.snippet.as_str()));
         self.tint_input = self
             .edited_state()
             .and_then(|s| s.tint)
@@ -1096,11 +1237,17 @@ impl App {
                     .collect()
             };
             let launch = (kind == PadKind::Keys && b.launch && !b.target.trim().is_empty()).then(|| b.target.clone());
+            let text = (kind == PadKind::Keys && b.text && (!b.snippet.is_empty() || b.enter))
+                .then(|| if b.enter { format!("{}\n", b.snippet) } else { b.snippet.clone() });
+            let sound =
+                (kind == PadKind::Keys && b.sound && !b.sound_file.is_empty()).then(|| sound_path(&b.sound_file));
             buttons.push(PadButton {
                 kind,
-                toggle: b.toggle && kind == PadKind::Keys && launch.is_none(),
+                toggle: b.toggle && kind == PadKind::Keys && launch.is_none() && text.is_none() && sound.is_none(),
                 keys: b.keys,
                 launch,
+                text,
+                sound,
                 states,
                 state: if b.toggle { b.state } else { 0 },
             });
@@ -1187,7 +1334,7 @@ impl App {
                     b.state = state;
                 }
                 if path == self.pad_path && id == self.pad_selected {
-                    self.sync_tint_input();
+                    self.sync_inputs();
                 }
                 // Движок уже знает новое состояние; пересобираем раскладку, чтобы копии совпадали.
                 self.apply_pad();
@@ -1596,6 +1743,69 @@ mod tests {
         app.tab = Tab::Stream;
         let _ = app.update(Message::FileDropped(PathBuf::from("/x.exe")));
         assert!(!app.pad.buttons[2].launch);
+    }
+
+    #[test]
+    fn text_button_sends_snippet() {
+        let mut app = app_with_labels(&["A"]);
+        let _ = app.update(Message::PadKind(ButtonKind::Toggle));
+        let _ = app.update(Message::PadKind(ButtonKind::Text));
+        let paste = text_editor::Edit::Paste(std::sync::Arc::new("Всем\nпривет!".into()));
+        let _ = app.update(Message::PadSnippet(text_editor::Action::Edit(paste)));
+        let b = &app.pad.buttons[0];
+        assert!(b.text && !b.toggle && !b.is_empty());
+
+        let sent = |app: &App| {
+            let (mut pages, mut paths) = (Vec::new(), Vec::new());
+            app.build_page(&[], None, &mut pages, &mut paths);
+            pages.swap_remove(0).buttons
+        };
+        let buttons = sent(&app);
+        assert_eq!(buttons[0].text.as_deref(), Some("Всем\nпривет!"));
+        assert!(!buttons[0].toggle);
+        assert_eq!(buttons[1].text, None);
+
+        let _ = app.update(Message::PadEnter(true));
+        assert_eq!(sent(&app)[0].text.as_deref(), Some("Всем\nпривет!\n"), "Enter в конце");
+
+        // Выбрали другую кнопку — поле показывает её текст.
+        app.select(1);
+        assert_eq!(app.snippet_editor.text(), "");
+    }
+
+    #[test]
+    fn editor_shows_saved_text_on_startup() {
+        let mut saved = Settings::default();
+        saved.macropad.buttons[0].text = true;
+        saved.macropad.buttons[0].snippet = "gg wp".into();
+        let app = App::new(saved);
+        assert_eq!(app.snippet_editor.text(), "gg wp", "иначе первая правка затёрла бы текст");
+    }
+
+    #[test]
+    fn several_dropped_files_take_separate_cells() {
+        let mut app = app_with_labels(&[]);
+        app.tab = Tab::Macropad;
+        app.pad_hover = Some(2);
+        let _ = app.update(Message::FileDropped(PathBuf::from("/Sounds/a.mp3")));
+        let _ = app.update(Message::FileDropped(PathBuf::from("/Sounds/b.wav")));
+        assert_eq!(app.pad.buttons[2].states[0].label, "a", "первый — в ячейку под курсором");
+        assert_eq!(app.pad.buttons[0].states[0].label, "b", "второй — в свободную, а не поверх первого");
+    }
+
+    #[test]
+    fn dropped_sound_becomes_sound_button() {
+        let mut app = app_with_labels(&["A"]);
+        app.tab = Tab::Macropad;
+        let _ = app.update(Message::FileDropped(PathBuf::from("/Sounds/Bruh.MP3")));
+        let b = &app.pad.buttons[1];
+        assert!(b.sound && !b.launch);
+        assert_eq!(b.states[0].label, "Bruh");
+        assert!(b.sound_file.ends_with(".mp3"), "хранится копия в папке макропада");
+        let expected = settings::images_dir().join(&b.sound_file);
+        let (mut pages, mut paths) = (Vec::new(), Vec::new());
+        app.build_page(&[], None, &mut pages, &mut paths);
+        assert_eq!(pages[0].buttons[1].sound.as_deref().map(PathBuf::from), Some(expected));
     }
 
     #[test]

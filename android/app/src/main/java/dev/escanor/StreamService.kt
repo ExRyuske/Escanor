@@ -34,17 +34,22 @@ class StreamService : Service() {
         }
         startForeground(NOTIFICATION_ID, notification(), foregroundTypes())
         if (server == null) {
-            val v = VideoStreamer(this).also { video = it }
-            val a = AudioStreamer(this).also { audio = it }
+            val v = VideoStreamer(this)
+            val a = AudioStreamer(this)
             try {
                 server = Server(this, v, a).also { it.start() }
+                video = v
+                audio = a
+                wakeLock = getSystemService(PowerManager::class.java)
+                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "escanor:stream")
+                    .apply { acquire() }
             } catch (e: Exception) {
+                // Порт занят: ПК повторит запуск, и каждая попытка не должна оставлять поток камеры
+                // и неотпущенную блокировку сна.
                 Log.e(TAG, "server start failed", e)
+                v.release()
                 Status.set("Не удалось открыть порт ${Protocol.PORT}: ${e.message}")
             }
-            wakeLock = getSystemService(PowerManager::class.java)
-                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "escanor:stream")
-                .apply { acquire() }
         }
         running = true
         return START_NOT_STICKY

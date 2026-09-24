@@ -265,7 +265,11 @@ impl IKsControl_Impl for MediaStream_Impl {
 struct Frames {
     mapping: Option<Mapping>,
     last_attempt: Option<Instant>,
+    /// Последний целый кадр; его размеры — в `last`.
     buffer: Vec<u8>,
+    /// Сюда читается новый кадр. Порванное чтение (писатель успел перезаписать слот) оставляет
+    /// здесь мусор другого размера — `buffer` меняется только после успешного чтения.
+    scratch: Vec<u8>,
     last: Option<FrameInfo>,
     /// Разрешение, которое мы объявили в общей памяти как «используется».
     registered: Option<(u32, u32)>,
@@ -320,7 +324,8 @@ impl Frames {
         };
         let frames = mapping.frames();
         let after = self.last.map_or(0, |f| f.counter);
-        if let Some(info) = frames.read_latest(after, &mut self.buffer) {
+        if let Some(info) = frames.read_latest(after, &mut self.scratch) {
+            std::mem::swap(&mut self.buffer, &mut self.scratch);
             self.last = Some(info);
         }
         match self.last {

@@ -94,7 +94,9 @@ class AudioStreamer(private val context: Context) {
         private fun openAAudio(): Capture? {
             val handle = try {
                 NativeAudio.open(config.deviceId ?: 0, NativeAudio.preset(config.source), config.channels, SAMPLE_RATE)
-            } catch (e: UnsatisfiedLinkError) {
+            } catch (e: LinkageError) {
+                // Библиотеки нет: первое обращение бросает ExceptionInInitializerError, следующие —
+                // NoClassDefFoundError; оба — LinkageError, как и UnsatisfiedLinkError.
                 Log.w(TAG, "AAudio library missing", e)
                 0L
             }

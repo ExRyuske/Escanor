@@ -212,6 +212,12 @@ pub fn send(combo: &KeyCombo, down: bool) -> Result<()> {
     platform::send(combo, down)
 }
 
+/// Печатает текст на ПК как набранный с клавиатуры — независимо от раскладки.
+/// Перевод строки нажимает Enter.
+pub fn type_text(text: &str) -> Result<()> {
+    platform::type_text(text)
+}
+
 #[cfg(windows)]
 mod platform {
     use super::Key;
@@ -219,9 +225,9 @@ mod platform {
     use anyhow::{Result, bail};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-        KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-        MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+        MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
     };
 
     const XBUTTON1: u32 = 1;
@@ -307,10 +313,43 @@ mod platform {
         if !down {
             inputs.reverse();
         }
+        submit(&inputs)
+    }
+
+    const VK_RETURN: u16 = 0x0D;
+
+    fn unicode(unit: u16, up: bool) -> INPUT {
+        let mut flags = KEYEVENTF_UNICODE;
+        if up {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: unit, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+            },
+        }
+    }
+
+    pub fn type_text(text: &str) -> Result<()> {
+        let mut inputs = Vec::new();
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                // Enter — настоящей клавишей: символ перевода строки понимают не все окна.
+                inputs.extend([input(VK_RETURN, false, false), input(VK_RETURN, false, true)]);
+            }
+            for unit in line.trim_end_matches('\r').encode_utf16() {
+                inputs.extend([unicode(unit, false), unicode(unit, true)]);
+            }
+        }
+        submit(&inputs)
+    }
+
+    fn submit(inputs: &[INPUT]) -> Result<()> {
         if inputs.is_empty() {
             return Ok(());
         }
-        let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+        let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
         if sent as usize != inputs.len() {
             bail!("Windows не приняла нажатие (окно запущено от администратора?)");
         }
@@ -325,6 +364,10 @@ mod platform {
 
     pub fn send(_combo: &KeyCombo, _down: bool) -> Result<()> {
         bail!("нажатие клавиш пока работает только в Windows")
+    }
+
+    pub fn type_text(_text: &str) -> Result<()> {
+        bail!("печать текста пока работает только в Windows")
     }
 }
 
