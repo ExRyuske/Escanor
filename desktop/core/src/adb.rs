@@ -122,6 +122,11 @@ impl Adb {
         Ok(())
     }
 
+    /// Останавливает сервер adb: он запущен из папки программы и держит свой exe.
+    pub fn kill_server(&self) {
+        let _ = self.run(None, &["kill-server"]);
+    }
+
     pub fn remove_forward(&self, serial: &str, local: u16) {
         let _ = self.run(Some(serial), &["forward", "--remove", &format!("tcp:{local}")]);
     }

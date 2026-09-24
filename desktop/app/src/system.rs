@@ -22,7 +22,8 @@ pub use win::{autostart_enabled, set_autostart, take_single_instance};
 #[cfg(windows)]
 mod win {
     use anyhow::Result;
-    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
     use windows::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteValueW,
         RegGetValueW, RegOpenKeyExW, RegSetValueExW,
@@ -83,12 +84,24 @@ mod win {
 
     /// `false`, если Escanor уже запущен: тогда его окно выводится на передний план.
     /// Два экземпляра стали бы отбирать друг у друга телефон и виртуальную камеру.
-    pub fn take_single_instance() -> bool {
+    /// `wait_for_previous` — после обновления: старая версия вот-вот завершится, ждём её.
+    pub fn take_single_instance(wait_for_previous: bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(15);
         unsafe {
-            // Мьютекс живёт до конца процесса: дескриптор намеренно не закрывается.
-            let _ = CreateMutexW(None, false, w!("Local\\EscanorSingleInstance"));
-            if GetLastError() != ERROR_ALREADY_EXISTS {
-                return true;
+            loop {
+                // Мьютекс живёт до конца процесса: дескриптор намеренно не закрывается.
+                let handle = CreateMutexW(None, false, w!("Local\\EscanorSingleInstance"));
+                if GetLastError() != ERROR_ALREADY_EXISTS {
+                    return true;
+                }
+                // Чужой мьютекс не держим: иначе он не исчезнет и после выхода старой версии.
+                if let Ok(handle) = handle {
+                    let _ = CloseHandle(handle);
+                }
+                if !wait_for_previous || Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
             if let Ok(window) = FindWindowW(PCWSTR::null(), w!("Escanor")) {
                 let _ = ShowWindow(window, SW_SHOW);
@@ -111,6 +124,6 @@ pub fn set_autostart(_: bool) -> anyhow::Result<()> {
 }
 
 #[cfg(not(windows))]
-pub fn take_single_instance() -> bool {
+pub fn take_single_instance(_wait_for_previous: bool) -> bool {
     true
 }

@@ -9,9 +9,14 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 pub const REPO: &str = "ExRyuske/Escanor";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// С этим аргументом запускается новая версия сразу после обновления: она дожидается
+/// завершения старой и удаляет оставшиеся от неё файлы.
+pub const UPDATED_ARG: &str = "--updated";
 
 /// Суффикс для файлов, которые заменены обновлением, но ещё заняты работающей программой.
 const OLD: &str = "old";
@@ -140,28 +145,57 @@ fn old_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Путь к exe, запомненный при запуске (первый вызов — из `cleanup` в `main`). После обновления
+/// работающий файл переименован в `.old`, а запускать нужно новый — по прежнему пути.
+fn exe() -> Result<PathBuf> {
+    static EXE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    EXE.get_or_init(|| std::env::current_exe().ok()).clone().context("не найден exe программы")
+}
+
 fn program_dir() -> Result<PathBuf> {
-    Ok(std::env::current_exe()?.parent().context("нет папки программы")?.to_path_buf())
+    Ok(exe()?.parent().context("нет папки программы")?.to_path_buf())
 }
 
 /// Запускает новую версию и завершает текущую.
 pub fn restart() -> ! {
-    if let Ok(exe) = std::env::current_exe() {
-        let args: Vec<String> = std::env::args().skip(1).filter(|a| a != crate::system::TRAY_ARG).collect();
+    // Сервер adb запущен из папки программы: пока он работает, старый adb.exe не удалить.
+    escanor_core::adb::Adb::locate().kill_server();
+    if let Ok(exe) = exe() {
+        let mut args: Vec<String> =
+            std::env::args().skip(1).filter(|a| a != crate::system::TRAY_ARG && a != UPDATED_ARG).collect();
+        args.push(UPDATED_ARG.into());
         let _ = std::process::Command::new(exe).args(args).spawn();
     }
     std::process::exit(0)
 }
 
-/// Удаляет файлы, оставшиеся от прошлого обновления. Занятые удалятся в следующий раз.
-pub fn cleanup() {
+/// Удаляет файлы, оставшиеся от прошлого обновления. Сразу после обновления старая версия ещё
+/// может завершаться и держать свои файлы — тогда пробуем ещё несколько секунд в фоне.
+pub fn cleanup(after_update: bool) {
     let Ok(dir) = program_dir() else { return };
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    if remove_old_files(&dir) || !after_update {
+        return;
+    }
+    std::thread::spawn(move || {
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(250));
+            if remove_old_files(&dir) {
+                return;
+            }
+        }
+    });
+}
+
+/// `true` — ни одного `.old` не осталось.
+fn remove_old_files(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return true };
+    let mut clean = true;
     for entry in entries.flatten() {
-        if entry.path().extension().is_some_and(|e| e == OLD) {
-            let _ = std::fs::remove_file(entry.path());
+        if entry.path().extension().is_some_and(|e| e == OLD) && std::fs::remove_file(entry.path()).is_err() {
+            clean = false;
         }
     }
+    clean
 }
 
 #[cfg(test)]
@@ -175,6 +209,20 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("0.1.0", "0.2.0"));
         assert!(!is_newer("abc", "0.1.0"));
+    }
+
+    #[test]
+    fn removes_only_old_files() {
+        let dir = std::env::temp_dir().join("escanor-update-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["escanor.exe", "escanor.exe.old", "adb.exe.old"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        assert!(remove_old_files(&dir));
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, ["escanor.exe"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

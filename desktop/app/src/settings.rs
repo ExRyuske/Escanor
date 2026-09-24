@@ -2,7 +2,7 @@
 //! Файл settings.json и папка macropad лежат рядом с программой.
 
 use anyhow::{Context, Result};
-use escanor_core::keys::KeyCombo;
+use escanor_core::keys::{KeyCombo, TextMode};
 use escanor_core::macropad::{Amoled, Orientation};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -90,8 +90,8 @@ pub struct MacropadSettings {
     pub sound_output: Option<String>,
     /// Выравнивать громкость звуков саундпада.
     pub normalize_sounds: bool,
-    /// Общая громкость саундпада, %.
-    pub sound_volume: u32,
+    /// Общая громкость саундпада, дБ: 0 — без ослабления, `SOUND_MUTE_DB` — выключено.
+    pub sound_volume_db: i32,
 }
 
 impl Default for MacropadSettings {
@@ -105,7 +105,7 @@ impl Default for MacropadSettings {
             buttons: Vec::new(),
             sound_output: None,
             normalize_sounds: true,
-            sound_volume: 100,
+            sound_volume_db: 0,
         };
         pad.resize();
         pad
@@ -168,6 +168,9 @@ fn resize_page(buttons: &mut Vec<ButtonSettings>, count: usize) {
     }
 }
 
+/// Крайнее левое положение ползунка громкости саундпада — звук выключен.
+pub const SOUND_MUTE_DB: i32 = -60;
+
 /// Число состояний у переключателя.
 pub const TOGGLE_STATES: usize = 2;
 
@@ -192,9 +195,14 @@ pub struct ButtonSettings {
     pub text: bool,
     pub snippet: String,
     pub enter: bool,
-    /// Звук: касание проигрывает на ПК файл `sound_file` из папки макропада.
+    /// Способ ввода: юникодом (как раньше) или настоящими клавишами.
+    pub text_mode: TextMode,
+    /// Звук: касание проигрывает на ПК файл `sound_file` из папки макропада — отрезок
+    /// от `sound_start_ms` до `sound_end_ms` (`None` — до конца). Сам файл не меняется.
     pub sound: bool,
     pub sound_file: String,
+    pub sound_start_ms: u32,
+    pub sound_end_ms: Option<u32>,
 }
 
 impl Default for ButtonSettings {
@@ -211,8 +219,11 @@ impl Default for ButtonSettings {
             text: false,
             snippet: String::new(),
             enter: false,
+            text_mode: TextMode::default(),
             sound: false,
             sound_file: String::new(),
+            sound_start_ms: 0,
+            sound_end_ms: None,
         };
         button.normalize();
         button

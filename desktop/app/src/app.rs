@@ -6,11 +6,12 @@ use crate::tray::{Tray, TrayCommand};
 use crate::update::{self, Release};
 use escanor_core::adb::AdbDevice;
 use escanor_core::audio::{AudioOutputInfo, looks_virtual};
-use escanor_core::keys::{Key, KeyCombo};
-use escanor_core::macropad::{Orientation, PadButton, PadKind, PadLayout, PadPage, PadState};
+use escanor_core::keys::{Key, KeyCombo, TextMode};
+use escanor_core::macropad::{Orientation, PadButton, PadKind, PadLayout, PadPage, PadState, SoundRef};
 use escanor_core::protocol::{
     AudioParams, AudioStarted, CameraInfo, Controls, Devices, PhoneInfo, VideoParams, VideoStarted,
 };
+use escanor_core::soundpad::{self, SoundInfo};
 use escanor_core::vcam::VcamStatus;
 use escanor_core::{Command, EngineHandle, Event, Stats};
 use iced::widget::{image, text_editor};
@@ -19,11 +20,21 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+/// Столбиков в волне звука в редакторе кнопки.
+pub const WAVE_BARS: usize = 72;
+/// Короче этого отрезок звука не обрезается.
+const MIN_SOUND_MS: u32 = 50;
+
 /// Звуковые файлы, которые умеет саундпад.
 const SOUND_EXTENSIONS: [&str; 5] = ["mp3", "wav", "ogg", "flac", "oga"];
 
 fn is_sound(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| SOUND_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+}
+
+/// Множитель громкости по ослаблению в децибелах; крайнее положение — тишина.
+fn sound_gain(db: i32) -> f32 {
+    if db <= settings::SOUND_MUTE_DB { 0.0 } else { 10f32.powf(db.min(0) as f32 / 20.0) }
 }
 
 /// Полный путь к звуку из папки макропада.
@@ -115,14 +126,30 @@ pub enum Message {
     PadSnippet(text_editor::Action),
     /// Нажимать Enter после текста.
     PadEnter(bool),
+    /// Способ ввода текста кнопки.
+    PadTextMode(TextMode),
     /// Файл для кнопки-звука.
     PadPickSound,
     PadSoundPicked(Option<PathBuf>),
     /// Устройство вывода звуков саундпада.
     PadSoundOutput(OutputChoice),
     PadNormalize(bool),
-    /// Общая громкость саундпада, %.
-    PadSoundVolume(u32),
+    /// Общая громкость саундпада, дБ.
+    PadSoundVolume(i32),
+    /// Звук кнопки прочитан: длительность, волна, края без тишины.
+    SoundAnalyzed(String, Result<SoundInfo, String>),
+    /// Обрезка звука кнопки: начало и конец отрезка, мс.
+    PadSoundStart(u32),
+    PadSoundEnd(u32),
+    /// Начало и конец отрезка, введённые с клавиатуры (секунды); Enter — подогнать под границы.
+    PadTrimStartInput(String),
+    PadTrimEndInput(String),
+    PadTrimInputDone,
+    /// Обрезать тишину по краям / вернуть звук целиком.
+    PadTrimSilence,
+    PadTrimReset,
+    /// Прослушать звук кнопки на этом ПК.
+    PadPreviewSound,
     PadPickApp,
     PadAppPicked(Option<PathBuf>),
     /// Файл, перетащенный на окно из Проводника: становится кнопкой-программой.
@@ -279,6 +306,11 @@ pub struct App {
     pub tint_input: String,
     /// Многострочное поле текста выбранной кнопки-текста.
     pub snippet_editor: text_editor::Content,
+    /// Поля начала и конца обрезки (пока вводятся, могут быть неполными).
+    pub trim_start_input: String,
+    pub trim_end_input: String,
+    /// Прочитанные звуки кнопок по имени файла; `None` — ещё читается.
+    sound_info: HashMap<String, Option<Result<SoundInfo, String>>>,
     /// Готовые картинки: (файл, цвет) → PNG и дескриптор для превью; `None` — файла нет.
     pad_images: HashMap<ImageKey, Option<(Vec<u8>, image::Handle)>>,
     /// Звук ещё не включали вручную — включим сами, если найдётся виртуальный кабель.
@@ -368,6 +400,9 @@ impl App {
             open_panels: Vec::new(),
             tint_input: String::new(),
             snippet_editor: text_editor::Content::new(),
+            trim_start_input: String::new(),
+            trim_end_input: String::new(),
+            sound_info: HashMap::new(),
             pad_images: HashMap::new(),
             audio_auto: saved.audio_enabled.is_none(),
             close_to_tray: saved.close_to_tray,
@@ -460,8 +495,77 @@ impl App {
                 Task::none()
             }
         };
+        let analyze = self.analyze_selected_sound();
         self.persist();
-        task
+        Task::batch([task, analyze])
+    }
+
+    /// Читает звук выбранной кнопки в фоне, если его ещё не читали: редактору нужны волна и длительность.
+    fn analyze_selected_sound(&mut self) -> Task<Message> {
+        let Some(name) =
+            self.selected_button().filter(|b| b.sound && !b.sound_file.is_empty()).map(|b| b.sound_file.clone())
+        else {
+            return Task::none();
+        };
+        if self.sound_info.contains_key(&name) {
+            return Task::none();
+        }
+        self.sound_info.insert(name.clone(), None);
+        let path = settings::images_dir().join(&name);
+        background(
+            move || soundpad::analyze(&path, WAVE_BARS).map_err(|e| format!("{e:#}")),
+            move |result| Message::SoundAnalyzed(name, result),
+        )
+    }
+
+    /// Прочитанный звук выбранной кнопки: `Some(None)` — ещё читается.
+    pub fn selected_sound_info(&self) -> Option<Option<&Result<SoundInfo, String>>> {
+        let b = self.selected_button().filter(|b| b.sound && !b.sound_file.is_empty())?;
+        self.sound_info.get(&b.sound_file).map(Option::as_ref)
+    }
+
+    fn selected_sound_duration(&self) -> Option<u32> {
+        match self.selected_sound_info() {
+            Some(Some(Ok(info))) => Some(info.duration_ms),
+            _ => None,
+        }
+    }
+
+    /// Меняет отрезок звука выбранной кнопки: начало и конец в пределах файла, между ними — не меньше
+    /// `MIN_SOUND_MS`. Конец, равный длительности, хранится как «до конца файла».
+    fn set_sound_range(&mut self, start: u32, end: u32) {
+        let Some(duration) = self.selected_sound_duration() else { return };
+        let end = end.min(duration);
+        let start = start.min(end.saturating_sub(MIN_SOUND_MS));
+        let end = end.max((start + MIN_SOUND_MS).min(duration));
+        if let Some(b) = self.selected_button_mut() {
+            b.sound_start_ms = start;
+            b.sound_end_ms = (end < duration).then_some(end);
+        }
+        self.apply_pad();
+    }
+
+    fn set_sound_start(&mut self, start: u32) {
+        let end = self.selected_button().and_then(|b| b.sound_end_ms).unwrap_or(u32::MAX);
+        self.set_sound_range(start, end);
+    }
+
+    fn set_sound_end(&mut self, end: u32) {
+        let start = self.selected_button().map_or(0, |b| b.sound_start_ms);
+        self.set_sound_range(start, end);
+    }
+
+    /// Поля начала и конца обрезки — под текущий отрезок выбранной кнопки.
+    fn sync_trim_inputs(&mut self) {
+        let duration = self.selected_sound_duration();
+        let range = self.selected_button().zip(duration).map(|(b, d)| (b.sound_start_ms, b.sound_end_ms.unwrap_or(d)));
+        (self.trim_start_input, self.trim_end_input) =
+            range.map_or_else(Default::default, |(start, end)| (format_seconds(start), format_seconds(end)));
+    }
+
+    fn selected_sound_ref(&self) -> Option<SoundRef> {
+        let b = self.selected_button().filter(|b| b.sound && !b.sound_file.is_empty())?;
+        Some(SoundRef { path: sound_path(&b.sound_file), start_ms: b.sound_start_ms, end_ms: b.sound_end_ms })
     }
 
     fn apply(&mut self, message: Message) {
@@ -705,6 +809,12 @@ impl App {
                 }
                 self.apply_pad();
             }
+            Message::PadTextMode(mode) => {
+                if let Some(b) = self.selected_button_mut() {
+                    b.text_mode = mode;
+                }
+                self.apply_pad();
+            }
             Message::PadSoundPicked(Some(path)) => {
                 let index = self.pad_selected;
                 self.set_sound(index, &path);
@@ -718,8 +828,50 @@ impl App {
                 self.pad.normalize_sounds = on;
                 self.apply_soundpad();
             }
-            Message::PadSoundVolume(percent) => {
-                self.pad.sound_volume = percent;
+            Message::SoundAnalyzed(name, result) => {
+                self.sound_info.insert(name, Some(result));
+                self.sync_trim_inputs();
+            }
+            Message::PadSoundStart(start) => {
+                self.set_sound_start(start);
+                self.sync_trim_inputs();
+            }
+            Message::PadSoundEnd(end) => {
+                self.set_sound_end(end);
+                self.sync_trim_inputs();
+            }
+            // Правильное значение применяется сразу, а поле показывает, что введено, пока не нажат Enter.
+            Message::PadTrimStartInput(value) => {
+                if let Some(start) = parse_seconds(&value) {
+                    self.set_sound_start(start);
+                }
+                self.trim_start_input = value;
+            }
+            Message::PadTrimEndInput(value) => {
+                if let Some(end) = parse_seconds(&value) {
+                    self.set_sound_end(end);
+                }
+                self.trim_end_input = value;
+            }
+            Message::PadTrimInputDone => self.sync_trim_inputs(),
+            Message::PadTrimSilence => {
+                if let Some(Some(Ok(info))) = self.selected_sound_info() {
+                    let (start, end) = info.content_ms;
+                    self.set_sound_range(start, end);
+                }
+                self.sync_trim_inputs();
+            }
+            Message::PadTrimReset => {
+                self.set_sound_range(0, u32::MAX);
+                self.sync_trim_inputs();
+            }
+            Message::PadPreviewSound => {
+                if let Some(sound) = self.selected_sound_ref() {
+                    self.send(Command::PreviewSound(sound));
+                }
+            }
+            Message::PadSoundVolume(db) => {
+                self.pad.sound_volume_db = db;
                 self.apply_soundpad();
             }
             Message::PadAppPicked(Some(path)) => {
@@ -836,8 +988,7 @@ impl App {
     }
 
     fn apply_soundpad(&self) {
-        // Слух воспринимает громкость логарифмически: квадрат делает ползунок равномерным на слух.
-        let volume = (self.pad.sound_volume.min(100) as f32 / 100.0).powi(2);
+        let volume = sound_gain(self.pad.sound_volume_db);
         self.send(Command::SetSoundpad {
             output: self.pad.sound_output.clone(),
             normalize: self.pad.normalize_sounds,
@@ -1021,6 +1172,9 @@ impl App {
         b.toggle = false;
         b.state = 0;
         b.sound_file = name;
+        // Отрезок относился к прежнему файлу.
+        b.sound_start_ms = 0;
+        b.sound_end_ms = None;
         if b.states[0].label.is_empty() {
             b.states[0].label = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         }
@@ -1102,6 +1256,7 @@ impl App {
             .and_then(|s| s.tint)
             .map(|[r, g, b]| format!("#{r:02X}{g:02X}{b:02X}"))
             .unwrap_or_default();
+        self.sync_trim_inputs();
     }
 
     /// Картинка состояния для превью: `Some(None)` — файл удалён, `None` — картинки нет.
@@ -1239,14 +1394,18 @@ impl App {
             let launch = (kind == PadKind::Keys && b.launch && !b.target.trim().is_empty()).then(|| b.target.clone());
             let text = (kind == PadKind::Keys && b.text && (!b.snippet.is_empty() || b.enter))
                 .then(|| if b.enter { format!("{}\n", b.snippet) } else { b.snippet.clone() });
-            let sound =
-                (kind == PadKind::Keys && b.sound && !b.sound_file.is_empty()).then(|| sound_path(&b.sound_file));
+            let sound = (kind == PadKind::Keys && b.sound && !b.sound_file.is_empty()).then(|| SoundRef {
+                path: sound_path(&b.sound_file),
+                start_ms: b.sound_start_ms,
+                end_ms: b.sound_end_ms,
+            });
             buttons.push(PadButton {
                 kind,
                 toggle: b.toggle && kind == PadKind::Keys && launch.is_none() && text.is_none() && sound.is_none(),
                 keys: b.keys,
                 launch,
                 text,
+                text_mode: b.text_mode,
                 sound,
                 states,
                 state: if b.toggle { b.state } else { 0 },
@@ -1675,6 +1834,18 @@ fn background<T: Send + 'static>(
     Task::perform(async move { rx.await.unwrap_or_else(|_| Err("фоновая задача прервана".into())) }, done)
 }
 
+/// Секунды с сотыми для поля ввода: «1,25».
+fn format_seconds(ms: u32) -> String {
+    format!("{:.2}", ms as f64 / 1000.0).replace('.', ",")
+}
+
+/// Секунды из поля ввода: «1,25», «1.25» или «1,25 с» → миллисекунды.
+fn parse_seconds(value: &str) -> Option<u32> {
+    let value = value.trim().trim_end_matches(['с', 's']).trim().replace(',', ".");
+    let seconds: f64 = value.parse().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then(|| (seconds * 1000.0).round().min(u32::MAX as f64) as u32)
+}
+
 /// «#RRGGBB» или «RRGGBB».
 fn parse_hex(value: &str) -> Option<[u8; 3]> {
     let hex = value.trim().trim_start_matches('#');
@@ -1767,10 +1938,24 @@ mod tests {
 
         let _ = app.update(Message::PadEnter(true));
         assert_eq!(sent(&app)[0].text.as_deref(), Some("Всем\nпривет!\n"), "Enter в конце");
+        assert_eq!(sent(&app)[0].text_mode, TextMode::Unicode, "по умолчанию — как раньше");
+        let _ = app.update(Message::PadTextMode(TextMode::Keys));
+        assert_eq!(sent(&app)[0].text_mode, TextMode::Keys);
+        let old: ButtonSettings = serde_json::from_str(r#"{"text": true, "snippet": "gg"}"#).unwrap();
+        assert_eq!(old.text_mode, TextMode::Unicode, "старые настройки открываются обычным способом");
 
         // Выбрали другую кнопку — поле показывает её текст.
         app.select(1);
         assert_eq!(app.snippet_editor.text(), "");
+    }
+
+    #[test]
+    fn sound_volume_in_decibels() {
+        assert_eq!(sound_gain(0), 1.0);
+        assert!((sound_gain(-6) - 0.501).abs() < 0.001, "−6 дБ — вдвое тише по амплитуде");
+        assert!((sound_gain(-20) - 0.1).abs() < 1e-6);
+        assert_eq!(sound_gain(settings::SOUND_MUTE_DB), 0.0, "крайнее положение — без звука");
+        assert_eq!(sound_gain(5), 1.0, "громче исходного не усиливаем");
     }
 
     #[test]
@@ -1794,6 +1979,55 @@ mod tests {
     }
 
     #[test]
+    fn sound_trim_stays_inside_file() {
+        let mut app = app_with_labels(&[]);
+        app.tab = Tab::Macropad;
+        let _ = app.update(Message::FileDropped(PathBuf::from("/Sounds/boom.mp3")));
+        let name = app.pad.buttons[0].sound_file.clone();
+        let info = SoundInfo { duration_ms: 3000, peaks: vec![0.0; 4], content_ms: (800, 2100) };
+        let _ = app.update(Message::SoundAnalyzed(name, Ok(info)));
+
+        let _ = app.update(Message::PadTrimSilence);
+        let b = &app.pad.buttons[0];
+        assert_eq!((b.sound_start_ms, b.sound_end_ms), (800, Some(2100)));
+        let (mut pages, mut paths) = (Vec::new(), Vec::new());
+        app.build_page(&[], None, &mut pages, &mut paths);
+        let sent = pages[0].buttons[0].sound.clone().unwrap();
+        assert_eq!((sent.start_ms, sent.end_ms), (800, Some(2100)), "отрезок уходит в движок");
+
+        // Начало не заходит за конец, конец — за длительность.
+        let _ = app.update(Message::PadSoundStart(2900));
+        assert_eq!(app.pad.buttons[0].sound_start_ms, 2100 - MIN_SOUND_MS);
+        let _ = app.update(Message::PadSoundEnd(5000));
+        assert_eq!(app.pad.buttons[0].sound_end_ms, None, "до конца файла");
+
+        let _ = app.update(Message::PadTrimReset);
+        assert_eq!((app.pad.buttons[0].sound_start_ms, app.pad.buttons[0].sound_end_ms), (0, None));
+        assert_eq!((app.trim_start_input.as_str(), app.trim_end_input.as_str()), ("0,00", "3,00"));
+
+        // Ввод с клавиатуры: применяется сразу, Enter подгоняет поле под допустимое значение.
+        let _ = app.update(Message::PadTrimStartInput("0,5".into()));
+        assert_eq!(app.pad.buttons[0].sound_start_ms, 500);
+        assert_eq!(app.trim_start_input, "0,5", "поле не мешает дописывать");
+        let _ = app.update(Message::PadTrimEndInput("9".into()));
+        let _ = app.update(Message::PadTrimInputDone);
+        assert_eq!(app.trim_end_input, "3,00", "больше длительности — до конца файла");
+        let _ = app.update(Message::PadTrimStartInput("абв".into()));
+        assert_eq!(app.pad.buttons[0].sound_start_ms, 500, "мусор не меняет отрезок");
+    }
+
+    #[test]
+    fn parses_typed_seconds() {
+        assert_eq!(parse_seconds("1,25"), Some(1250));
+        assert_eq!(parse_seconds(" 1.25 с "), Some(1250));
+        assert_eq!(parse_seconds("2s"), Some(2000));
+        assert_eq!(parse_seconds("0"), Some(0));
+        assert_eq!(parse_seconds("-1"), None);
+        assert_eq!(parse_seconds(""), None);
+        assert_eq!(format_seconds(1250), "1,25");
+    }
+
+    #[test]
     fn dropped_sound_becomes_sound_button() {
         let mut app = app_with_labels(&["A"]);
         app.tab = Tab::Macropad;
@@ -1805,7 +2039,7 @@ mod tests {
         let expected = settings::images_dir().join(&b.sound_file);
         let (mut pages, mut paths) = (Vec::new(), Vec::new());
         app.build_page(&[], None, &mut pages, &mut paths);
-        assert_eq!(pages[0].buttons[1].sound.as_deref().map(PathBuf::from), Some(expected));
+        assert_eq!(pages[0].buttons[1].sound.as_ref().map(|s| PathBuf::from(&s.path)), Some(expected));
     }
 
     #[test]

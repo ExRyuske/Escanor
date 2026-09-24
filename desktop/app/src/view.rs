@@ -5,9 +5,9 @@ use crate::app::{
     App, BITRATES, BitrateChoice, ButtonKind, Connection, DimChoice, Message, Modifier, Panel, Tab, UpdateState,
     WbChoice,
 };
-use crate::settings::TOGGLE_STATES;
+use crate::settings::{ButtonSettings, SOUND_MUTE_DB, TOGGLE_STATES};
 use crate::style::{self, Tone};
-use escanor_core::keys::{Key, KeyCombo};
+use escanor_core::keys::{Key, KeyCombo, TextMode};
 use escanor_core::macropad::{Amoled, Orientation};
 use escanor_core::vcam::VcamStatus;
 use iced::font::Weight;
@@ -103,17 +103,35 @@ fn segmented<'a, T: Copy + PartialEq + 'a>(
     selected: T,
     on: impl Fn(T) -> Message,
 ) -> Element<'a, Message> {
-    let mut segments = Row::new().spacing(4);
-    for &(value, label) in options {
-        segments = segments.push(
-            button(text(label).size(SMALL).center().wrapping(text::Wrapping::None))
-                .width(Length::Fill)
-                .padding([6, 8])
-                .style(style::segment(value == selected))
-                .on_press(on(value)),
-        );
+    segmented_rows(options, options.len(), selected, on)
+}
+
+/// Сегменты в несколько строк по `per_row`: когда вариантов много, в одну строку их подписи не влезают.
+fn segmented_rows<'a, T: Copy + PartialEq + 'a>(
+    options: &[(T, &'a str)],
+    per_row: usize,
+    selected: T,
+    on: impl Fn(T) -> Message,
+) -> Element<'a, Message> {
+    let mut rows = Column::new().spacing(4);
+    for chunk in options.chunks(per_row.max(1)) {
+        let mut segments = Row::new().spacing(4);
+        for &(value, label) in chunk {
+            segments = segments.push(
+                button(text(label).size(SMALL).center().wrapping(text::Wrapping::None))
+                    .width(Length::Fill)
+                    .padding([6, 8])
+                    .style(style::segment(value == selected))
+                    .on_press(on(value)),
+            );
+        }
+        // Неполная последняя строка — такой же ширины ячейки, как остальные.
+        for _ in chunk.len()..per_row {
+            segments = segments.push(space().width(Length::Fill));
+        }
+        rows = rows.push(segments);
     }
-    container(segments).padding(3).style(style::inset).into()
+    container(rows).padding(3).style(style::inset).into()
 }
 
 /// Выпадающий список в общем стиле, на всю ширину.
@@ -508,41 +526,58 @@ fn stepper<'a>(value: u32, on: fn(u32) -> Message) -> Element<'a, Message> {
 
 fn macropad_view(app: &App) -> Element<'_, Message> {
     let pad = &app.pad;
+    // Всё, что над сеткой, — в одной панели: строка про экран телефона и строка про звуки.
+    let label = |value: &'static str| text(value).size(SMALL).style(style::muted);
     let phone = row![
-        switch("Показывать на телефоне", pad.enabled, Message::PadEnabled),
+        switch("На телефоне", pad.enabled, Message::PadEnabled),
         space::horizontal(),
-        select(Orientation::ALL, Some(pad.orientation), Message::PadOrientation).width(230),
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center);
-    let screen = row![
-        text("Сетка").size(SMALL).style(style::muted),
+        label("Сетка"),
         stepper(pad.columns, Message::PadColumns),
         text("×").size(BODY).style(style::muted),
         stepper(pad.rows, Message::PadRows),
-        space::horizontal(),
-        select(DimChoice::ALL, Some(DimChoice(pad.amoled.dim_after_secs)), Message::PadDim).width(230),
-        info(
-            "Экран телефона бережётся для AMOLED: чёрный фон, сетка раз в минуту сдвигается на пару пикселей, \
-             без касаний экран приглушается — касание сразу возвращает яркость и нажимает кнопку.",
-        ),
+        select(Orientation::ALL, Some(pad.orientation), Message::PadOrientation).width(180),
     ]
-    .spacing(10)
+    .spacing(8)
     .align_y(Alignment::Center);
-    let mut toolbar = column![phone, screen].spacing(12);
+    let mut screen =
+        row![select(DimChoice::ALL, Some(DimChoice(pad.amoled.dim_after_secs)), Message::PadDim).width(180)]
+            .spacing(8)
+            .align_y(Alignment::Center);
     if pad.amoled.dim_after_secs > 0 {
         // Ползунок меняет значение сразу, а на телефон оно уходит, когда его отпустят.
-        toolbar = toolbar.push(
-            row![
-                text("Яркость в затемнении").size(SMALL).style(style::muted),
-                slider(Amoled::BRIGHTNESS, pad.amoled.dim_brightness, Message::PadDimBrightness)
-                    .on_release(Message::PadDimCommit),
-                text(format!("{} %", pad.amoled.dim_brightness)).size(SMALL).width(44),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
+        screen = screen.push(label("Яркость")).push(
+            slider(Amoled::BRIGHTNESS, pad.amoled.dim_brightness, Message::PadDimBrightness)
+                .on_release(Message::PadDimCommit),
         );
+        screen = screen.push(text(format!("{} %", pad.amoled.dim_brightness)).size(SMALL).width(40));
+    } else {
+        screen = screen.push(space::horizontal());
     }
+    screen = screen.push(info(
+        "Экран телефона бережётся для AMOLED: чёрный фон, сетка раз в минуту сдвигается на пару пикселей, \
+         без касаний экран приглушается — касание сразу возвращает яркость и нажимает кнопку.",
+    ));
+    let volume = if pad.sound_volume_db <= SOUND_MUTE_DB {
+        "выкл".to_string()
+    } else {
+        format!("{} дБ", pad.sound_volume_db).replace('-', "−")
+    };
+    let sounds = row![
+        label("Звуки"),
+        select(app.output_choices(), Some(app.sound_output()), Message::PadSoundOutput).width(Length::FillPortion(1)),
+        slider(SOUND_MUTE_DB..=0, pad.sound_volume_db, Message::PadSoundVolume).width(Length::FillPortion(1)),
+        text(volume).size(SMALL).width(48),
+        switch("Выравнивать", pad.normalize_sounds, Message::PadNormalize),
+        info(
+            "Кнопки «Звук» проигрывают файлы на этом ПК в выбранное устройство. Чтобы их слышали собеседники, \
+             выберите виртуальный кабель, который в Discord или игре выбран микрофоном. Ползунок — общая \
+             громкость в децибелах, крайнее левое положение — без звука. «Выравнивать» делает громкие \
+             звуки тише, а тихие громче, чтобы все звучали примерно одинаково.",
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let toolbar = column![phone, screen, rule::horizontal(1), sounds].spacing(10);
 
     // Путь по папкам.
     let mut crumbs = row![].spacing(8).align_y(Alignment::Center);
@@ -580,31 +615,7 @@ fn macropad_view(app: &App) -> Element<'_, Message> {
     // Отпустили мышь мимо ячеек или увели курсор с сетки — перетаскивание отменяется.
     let grid = mouse_area(grid).on_release(Message::PadDragCancel).on_exit(Message::PadDragCancel);
 
-    let sounds = column![
-        titled(
-            "Звуки",
-            "Кнопки «Звук» проигрывают файлы на этом ПК. Чтобы их слышали собеседники, выберите виртуальный \
-             кабель, который в Discord или игре выбран микрофоном.",
-        ),
-        select(app.output_choices(), Some(app.sound_output()), Message::PadSoundOutput),
-        row![
-            text("Громкость").size(SMALL).style(style::muted),
-            slider(0..=100, pad.sound_volume, Message::PadSoundVolume),
-            text(format!("{} %", pad.sound_volume)).size(SMALL).width(44),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center),
-        row![
-            switch("Выравнивать громкость", pad.normalize_sounds, Message::PadNormalize),
-            info("Громкие звуки становятся тише, тихие — громче, чтобы все звучали примерно одинаково."),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    ]
-    .spacing(12);
-
-    let main =
-        column![panel(toolbar), panel(sounds), crumbs, container(grid).center_x(Length::Fill),].spacing(20).padding(24);
+    let main = column![panel(toolbar), crumbs, container(grid).center_x(Length::Fill)].spacing(16).padding(24);
 
     row![
         scrollable(main).width(Length::Fill).height(Length::Fill),
@@ -742,6 +753,95 @@ fn swatch<'a>(color: [u8; 3], selected: bool) -> Element<'a, Message> {
         .into()
 }
 
+/// Секунды с сотыми: «1,25 с».
+fn seconds(ms: u32) -> String {
+    format!("{:.2} с", ms as f32 / 1000.0).replace('.', ",")
+}
+
+/// Обрезка звука кнопки: волна, начало и конец отрезка, обрезка тишины и прослушивание.
+fn sound_trim<'a>(app: &App, b: &ButtonSettings) -> Option<Element<'a, Message>> {
+    let title = titled(
+        "Обрезка",
+        "Играет только выделенная часть — лишнее в начале и в конце пропускается, сам файл не меняется. \
+         Начало и конец можно двигать ползунком или вписать в секундах, например 1,25. «Убрать тишину» \
+         находит, где звук начинается и заканчивается.",
+    );
+    let info = match app.selected_sound_info()? {
+        None => return Some(column![title, hint("Читаю звук…")].spacing(12).into()),
+        Some(Err(e)) => {
+            return Some(
+                column![title, text(format!("Не удалось прочитать: {e}")).size(SMALL).style(style::bad)]
+                    .spacing(12)
+                    .into(),
+            );
+        }
+        Some(Ok(info)) => info,
+    };
+    let duration = info.duration_ms.max(1);
+    let (start, end) = (b.sound_start_ms, b.sound_end_ms.unwrap_or(duration));
+
+    // Волна: столбики по пикам; вырезанное — приглушено.
+    const HEIGHT: f32 = 48.0;
+    let mut wave = Row::new().spacing(1).height(HEIGHT).align_y(Alignment::Center);
+    let bars = info.peaks.len().max(1) as u64;
+    for (i, &peak) in info.peaks.iter().enumerate() {
+        let middle = ((i as u64 * 2 + 1) * duration as u64 / (bars * 2)) as u32;
+        let color = if (start..=end).contains(&middle) { style::ACCENT } else { style::BORDER };
+        // Корень поднимает тихие места, иначе на волне видны только самые громкие пики.
+        let height = (peak.sqrt() * HEIGHT).max(2.0);
+        wave = wave.push(
+            container(space())
+                .width(Length::Fill)
+                .height(height)
+                .style(move |_: &Theme| container::Style { background: Some(color.into()), ..Default::default() }),
+        );
+    }
+    let wave = container(wave).padding([6, 8]).style(style::inset);
+
+    let step: u32 = if duration > 60_000 { 100 } else { 10 };
+    let row_for = |name: &'a str, value: u32, on: fn(u32) -> Message, input: &str, typed: fn(String) -> Message| {
+        row![
+            text(name).size(SMALL).style(style::muted).width(52),
+            slider(0..=duration, value, on).step(step),
+            text_input("0,00", input)
+                .style(style::input)
+                .on_input(typed)
+                .on_submit(Message::PadTrimInputDone)
+                .size(SMALL)
+                .width(64),
+            text("с").size(SMALL).style(style::muted),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+    };
+    let trimmed = start > 0 || b.sound_end_ms.is_some();
+    Some(
+        column![
+            title,
+            wave,
+            row_for("Начало", start, Message::PadSoundStart, &app.trim_start_input, Message::PadTrimStartInput),
+            row_for("Конец", end, Message::PadSoundEnd, &app.trim_end_input, Message::PadTrimEndInput),
+            hint(format!("Играет {} из {}", seconds(end - start), seconds(duration))),
+            row![
+                button(text("Убрать тишину").size(SMALL).wrapping(text::Wrapping::None))
+                    .style(style::btn)
+                    .on_press(Message::PadTrimSilence),
+                button(text("Сбросить").size(SMALL))
+                    .style(style::btn_link)
+                    .on_press_maybe(trimmed.then_some(Message::PadTrimReset)),
+                space::horizontal(),
+                button(text("▶ Прослушать").size(SMALL).wrapping(text::Wrapping::None))
+                    .style(style::btn_primary)
+                    .on_press(Message::PadPreviewSound),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(10)
+        .into(),
+    )
+}
+
 fn button_editor(app: &App) -> Element<'_, Message> {
     let index = app.pad_selected;
     let (Some(b), Some(state)) = (app.selected_button(), app.edited_state()) else {
@@ -757,7 +857,7 @@ fn button_editor(app: &App) -> Element<'_, Message> {
     } else if b.sound {
         "Касание проигрывает звук на ПК в устройство, выбранное в блоке «Звуки»; повторное — останавливает."
     } else if b.text {
-        "Касание печатает заготовленный текст в активное окно на ПК — как будто его набрали с клавиатуры."
+        "Касание набирает заготовленный текст в активном окне на ПК — как будто его напечатали на клавиатуре."
     } else if b.toggle {
         "Нажатие отправляет сочетание и переключает кнопку на другое состояние — со своей картинкой и подписью."
     } else {
@@ -765,7 +865,7 @@ fn button_editor(app: &App) -> Element<'_, Message> {
     };
     let mut kind = column![
         titled("Кнопка", kind_tip),
-        segmented(
+        segmented_rows(
             &[
                 (ButtonKind::Normal, "Клавиши"),
                 (ButtonKind::Toggle, "Вкл/выкл"),
@@ -774,6 +874,7 @@ fn button_editor(app: &App) -> Element<'_, Message> {
                 (ButtonKind::Sound, "Звук"),
                 (ButtonKind::Folder, "Папка"),
             ],
+            3,
             if b.folder {
                 ButtonKind::Folder
             } else if b.launch {
@@ -892,11 +993,7 @@ fn button_editor(app: &App) -> Element<'_, Message> {
 
     if b.text {
         let snippet = column![
-            titled(
-                "Что печатать",
-                "Текст печатается в окно, где сейчас курсор, — с любыми символами и эмодзи, при любой раскладке. \
-                 Каждый перевод строки нажимает Enter.",
-            ),
+            titled("Что набирать", "Текст набирается в окне, где сейчас курсор; перевод строки нажимает Enter.",),
             text_editor(&app.snippet_editor)
                 .placeholder("Например: Всем привет!")
                 .style(style::editor)
@@ -904,6 +1001,17 @@ fn button_editor(app: &App) -> Element<'_, Message> {
                 .height(96)
                 .size(14),
             switch("Нажать Enter в конце", b.enter, Message::PadEnter),
+            field_tip(
+                "Способ ввода",
+                "«Обычный» печатает любые символы, включая эмодзи, — для мессенджеров и браузера. \
+                 «Клавишами» — если в игре или программе вместо букв появляются «?»: нажимает настоящие \
+                 клавиши текущей раскладки, поэтому перед вводом включите нужный язык.",
+                segmented(
+                    &[(TextMode::Unicode, "Обычный"), (TextMode::Keys, "Клавишами")],
+                    b.text_mode,
+                    Message::PadTextMode,
+                ),
+            ),
         ]
         .spacing(12);
         return column![panel(kind), panel(look), panel(snippet)].spacing(14).into();
@@ -933,7 +1041,13 @@ fn button_editor(app: &App) -> Element<'_, Message> {
             button(text(pick).size(SMALL)).style(style::btn).on_press(Message::PadPickSound),
         ]
         .spacing(12);
-        return column![panel(kind), panel(look), panel(sound)].spacing(14).into();
+        let mut panels = column![panel(kind), panel(look), panel(sound)].spacing(14);
+        if app.sound_exists(&b.sound_file)
+            && let Some(trim) = sound_trim(app, b)
+        {
+            panels = panels.push(panel(trim));
+        }
+        return panels.into();
     }
 
     // Что нажимается на ПК.

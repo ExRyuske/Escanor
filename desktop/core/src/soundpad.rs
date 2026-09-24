@@ -5,6 +5,7 @@
 //! усиливается или ослабляется до общего уровня — насколько позволяет пик, чтобы не было перегрузки.
 
 use crate::engine::{Event, EventSink};
+use crate::macropad::SoundRef;
 use anyhow::{Context, Result, anyhow, ensure};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
@@ -33,6 +34,11 @@ const CACHE_BYTES: usize = 128 << 20;
 const MAX_SECONDS: usize = 600;
 /// Сколько звуков играет одновременно; следующий вытесняет самый старый.
 const MAX_VOICES: usize = 16;
+/// Тише этого пика (−45 dBFS) край звука считается тишиной.
+const SILENCE_PEAK: f32 = 0.0056;
+/// Запас при обрезке тишины: перед атакой и после затухания.
+const TRIM_PAD_BEFORE_MS: u32 = 10;
+const TRIM_PAD_AFTER_MS: u32 = 50;
 /// Сколько устройство вывода остаётся открытым после последнего звука.
 const IDLE_CLOSE: Duration = Duration::from_secs(10);
 
@@ -59,6 +65,50 @@ impl Clip {
     fn bytes(&self) -> usize {
         self.samples.len() * size_of::<i16>()
     }
+
+    /// Кадры отрезка `[start, end)` звука кнопки, в пределах файла.
+    fn range(&self, sound: &SoundRef) -> (usize, usize) {
+        let frame = |ms: u32| (ms as u64 * self.rate as u64 / 1000) as usize;
+        let end = sound.end_ms.map_or(self.frames(), frame).min(self.frames());
+        (frame(sound.start_ms).min(end), end)
+    }
+
+    fn info(&self, buckets: usize) -> SoundInfo {
+        let ms = |frame: usize| (frame as u64 * 1000 / self.rate as u64) as u32;
+        let frames = self.frames();
+        let peak = |from: usize, to: usize| {
+            self.samples[from * self.channels..to * self.channels].iter().map(|s| s.unsigned_abs()).max().unwrap_or(0)
+        };
+        let peaks =
+            (0..buckets).map(|i| peak(frames * i / buckets, frames * (i + 1) / buckets) as f32 / 32768.0).collect();
+        // Края без звука — по окнам в 10 мс, тише порога. Немного запаса, чтобы не срезать атаку и затухание.
+        let window = (self.rate as usize / 100).max(1);
+        let loud = |w: usize| peak(w * window, ((w + 1) * window).min(frames)) as f32 / 32768.0 > SILENCE_PEAK;
+        let windows = frames.div_ceil(window);
+        let content = match ((0..windows).find(|&w| loud(w)), (0..windows).rev().find(|&w| loud(w))) {
+            (Some(first), Some(last)) => (
+                ms(first * window).saturating_sub(TRIM_PAD_BEFORE_MS),
+                (ms(((last + 1) * window).min(frames)) + TRIM_PAD_AFTER_MS).min(ms(frames)),
+            ),
+            _ => (0, ms(frames)),
+        };
+        SoundInfo { duration_ms: ms(frames), peaks, content_ms: content }
+    }
+}
+
+/// Звук для редактора кнопки: длительность, волна и где он начинается и заканчивается без тишины.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SoundInfo {
+    pub duration_ms: u32,
+    /// Пик каждого из равных отрезков, 0..1.
+    pub peaks: Vec<f32>,
+    /// Начало и конец звука без тишины по краям, мс.
+    pub content_ms: (u32, u32),
+}
+
+/// Декодирует файл и описывает его для редактора: волна из `buckets` столбиков.
+pub fn analyze(path: &Path, buckets: usize) -> Result<SoundInfo> {
+    Ok(decode(path)?.info(buckets))
 }
 
 /// Файл mp3, wav, ogg или flac → звук в памяти.
@@ -197,14 +247,22 @@ struct Voice {
     clip: Arc<Clip>,
     /// Позиция в кадрах звука (дробная — для передискретизации).
     pos: f64,
+    /// Кадр, на котором звук заканчивается (конец выбранного отрезка).
+    end: usize,
     /// Уже с переводом из 16 бит в диапазон ±1.
     gain: f32,
 }
 
 impl Voice {
-    fn new(path: String, clip: Arc<Clip>, normalize: bool) -> Self {
-        let gain = if normalize { clip.gain } else { 1.0 } / 32768.0;
-        Self { path, clip, pos: 0.0, gain }
+    fn new(sound: &SoundRef, clip: Arc<Clip>, normalize: bool) -> Self {
+        let (start, end) = clip.range(sound);
+        let gain = match normalize {
+            false => 1.0,
+            // Громкость — по тому, что играет: вырезанный громкий щелчок не должен приглушать остальное.
+            true if (start, end) == (0, clip.frames()) => clip.gain,
+            true => loudness_gain(&clip.samples[start * clip.channels..end * clip.channels], clip.channels, clip.rate),
+        };
+        Self { path: sound.path.clone(), clip, pos: start as f64, end, gain: gain / 32768.0 }
     }
 
     /// Добавляет себя в `out`; `false` — звук закончился.
@@ -213,7 +271,7 @@ impl Voice {
         let step = clip.rate as f64 / out_rate as f64;
         for frame in out.chunks_exact_mut(out_channels) {
             let index = self.pos as usize;
-            if index + 1 >= clip.frames() {
+            if index + 1 >= self.end {
                 return false;
             }
             let frac = (self.pos - index as f64) as f32;
@@ -324,7 +382,8 @@ impl Soundpad {
     }
 
     /// Запускает звук с начала; если он уже играет — останавливает.
-    pub fn toggle(&mut self, path: &str) {
+    pub fn toggle(&mut self, sound: &SoundRef) {
+        let path = sound.path.as_str();
         {
             let mut mixer = self.mixer.lock().unwrap();
             let before = mixer.voices.len();
@@ -348,28 +407,29 @@ impl Soundpad {
         self.idle_since = None;
         let cached = self.cache.lock().unwrap().get(path);
         if let Some(clip) = cached {
-            self.mixer.lock().unwrap().play(Voice::new(path.to_string(), clip, self.normalize));
+            self.mixer.lock().unwrap().play(Voice::new(sound, clip, self.normalize));
             return;
         }
         self.loading.lock().unwrap().insert(path.to_string());
-        let (cache, loading, mixer, events, path, normalize) = (
+        let (cache, loading, mixer, events, sound, normalize) = (
             self.cache.clone(),
             self.loading.clone(),
             self.mixer.clone(),
             self.events.clone(),
-            path.to_string(),
+            sound.clone(),
             self.normalize,
         );
         // Незагруженный файл декодируется в фоне, чтобы не задерживать остальные нажатия.
         std::thread::spawn(move || {
-            let result = decode(Path::new(&path));
-            let wanted = loading.lock().unwrap().remove(&path);
+            let path = sound.path.as_str();
+            let result = decode(Path::new(path));
+            let wanted = loading.lock().unwrap().remove(path);
             match result {
                 Ok(clip) => {
                     let clip = Arc::new(clip);
-                    cache.lock().unwrap().insert(&path, clip.clone());
+                    cache.lock().unwrap().insert(path, clip.clone());
                     if wanted {
-                        mixer.lock().unwrap().play(Voice::new(path, clip, normalize));
+                        mixer.lock().unwrap().play(Voice::new(&sound, clip, normalize));
                     }
                 }
                 Err(e) => events(Event::Error(format!("Саундпад: {e:#}"))),
@@ -530,6 +590,10 @@ mod tests {
         Clip::new(samples, 1, 48_000)
     }
 
+    fn whole(path: &str) -> SoundRef {
+        SoundRef { path: path.into(), start_ms: 0, end_ms: None }
+    }
+
     #[test]
     fn loud_and_quiet_sounds_meet_at_one_level() {
         let loud = clip(tone(0.9, 48_000));
@@ -583,7 +647,7 @@ mod tests {
     #[test]
     fn mixer_plays_mono_to_stereo_with_volume_and_drops_finished() {
         let mut mixer = Mixer { volume: 0.5, ..Default::default() };
-        mixer.play(Voice::new("a".into(), Arc::new(clip(vec![16_384; 10])), false));
+        mixer.play(Voice::new(&whole("a"), Arc::new(clip(vec![16_384; 10])), false));
         let mut out = vec![0.0f32; 8];
         mixer.render(&mut out, 2, 48_000);
         assert!(out.iter().all(|&s| (s - 0.25).abs() < 1e-6));
@@ -594,10 +658,53 @@ mod tests {
     }
 
     #[test]
+    fn trimmed_sound_plays_only_its_part() {
+        // 1 с тишины, 1 с звука, 1 с тишины при 1 кГц — миллисекунда на кадр.
+        let mut samples = vec![0i16; 1000];
+        samples.extend(vec![8_000; 1000]);
+        samples.extend(vec![0; 1000]);
+        let clip = Arc::new(Clip::new(samples, 1, 1000));
+        let sound = SoundRef { path: "a".into(), start_ms: 1000, end_ms: Some(2000) };
+        let mut mixer = Mixer::default();
+        mixer.play(Voice::new(&sound, clip.clone(), false));
+        let mut out = vec![0.0f32; 999];
+        mixer.render(&mut out, 1, 1000);
+        assert!(out.iter().all(|&s| s > 0.2), "начинается сразу со звука, тишина пропущена");
+        mixer.render(&mut out, 1, 1000);
+        assert!(mixer.voices.is_empty(), "заканчивается на конце отрезка, не доигрывая тишину");
+
+        // Отрезок за пределами файла не выходит за него.
+        let beyond = SoundRef { path: "a".into(), start_ms: 5000, end_ms: Some(9000) };
+        assert_eq!(clip.range(&beyond), (3000, 3000));
+    }
+
+    #[test]
+    fn finds_silent_edges_and_normalizes_by_played_part() {
+        let mut samples = vec![0i16; 48_000];
+        samples.extend(tone(0.2, 24_000));
+        samples.extend(vec![0; 48_000]);
+        let clip = Arc::new(clip(samples));
+        let info = clip.info(50);
+        assert_eq!(info.duration_ms, 2500);
+        assert_eq!(info.peaks.len(), 50);
+        assert!(info.peaks[0] == 0.0 && info.peaks[25] > 0.1);
+        let (start, end) = info.content_ms;
+        assert!((985..=1000).contains(&start), "звук с 1000 мс, небольшой запас до атаки: {start}");
+        assert!((1500..=1560).contains(&end), "звук до 1500 мс, запас на затухание: {end}");
+
+        // Вырезанный громкий щелчок не приглушает оставшийся звук.
+        let mut with_click = tone(0.05, 48_000);
+        with_click.extend(vec![32_000; 10]);
+        let click = Arc::new(super::Clip::new(with_click, 1, 48_000));
+        let cut = SoundRef { path: "c".into(), start_ms: 0, end_ms: Some(1000) };
+        assert!(Voice::new(&cut, click.clone(), true).gain > Voice::new(&whole("c"), click, true).gain);
+    }
+
+    #[test]
     fn voices_are_capped() {
         let mut mixer = Mixer::default();
         for i in 0..MAX_VOICES + 3 {
-            mixer.play(Voice::new(i.to_string(), Arc::new(clip(vec![0; 10])), true));
+            mixer.play(Voice::new(&whole(&i.to_string()), Arc::new(clip(vec![0; 10])), true));
         }
         assert_eq!(mixer.voices.len(), MAX_VOICES);
         assert_eq!(mixer.voices[0].path, "3", "вытесняются самые старые");

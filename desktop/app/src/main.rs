@@ -32,11 +32,13 @@ fn main() -> iced::Result {
         std::process::exit(code);
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    // Второй экземпляр только выводит первый на передний план.
-    if !system::take_single_instance() {
+    // Второй экземпляр только выводит первый на передний план. Новая версия после обновления
+    // сначала дожидается, пока старая завершится.
+    let updated = std::env::args().any(|a| a == update::UPDATED_ARG);
+    if !system::take_single_instance(updated) {
         return Ok(());
     }
-    update::cleanup();
+    update::cleanup(updated);
 
     let start_hidden = std::env::args().any(|a| a == system::TRAY_ARG);
     const ICON: u32 = 64;

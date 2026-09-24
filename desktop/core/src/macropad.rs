@@ -66,8 +66,9 @@ pub struct PadButton {
     pub launch: Option<String>,
     /// Заготовленный текст: касание печатает его на ПК вместо нажатия клавиш.
     pub text: Option<String>,
+    pub text_mode: crate::keys::TextMode,
     /// Звуковой файл: касание проигрывает его на ПК (саундпад).
-    pub sound: Option<String>,
+    pub sound: Option<SoundRef>,
     /// Одно состояние у обычной кнопки и папки, два — у переключателя.
     pub states: Vec<PadState>,
     pub state: usize,
@@ -77,6 +78,16 @@ impl PadButton {
     pub fn current(&self) -> Option<&PadState> {
         self.states.get(self.state).or_else(|| self.states.first())
     }
+}
+
+/// Звук кнопки: файл и отрезок, который из него играется. Файл не меняется — лишнее
+/// в начале и в конце просто пропускается.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SoundRef {
+    pub path: String,
+    pub start_ms: u32,
+    /// `None` — до конца файла.
+    pub end_ms: Option<u32>,
 }
 
 /// Страница макропада: корневая или папка.

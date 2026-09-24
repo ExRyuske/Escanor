@@ -212,10 +212,45 @@ pub fn send(combo: &KeyCombo, down: bool) -> Result<()> {
     platform::send(combo, down)
 }
 
-/// Печатает текст на ПК как набранный с клавиатуры — независимо от раскладки.
-/// Перевод строки нажимает Enter.
-pub fn type_text(text: &str) -> Result<()> {
-    platform::type_text(text)
+/// Способ ввода заготовленного текста.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextMode {
+    /// Символы юникодом: любые буквы и эмодзи, раскладка не трогается. Подходит мессенджерам
+    /// и браузеру; некоторые игры и старые программы показывают вместо букв «?».
+    #[default]
+    Unicode,
+    /// Настоящие нажатия клавиш, как с клавиатуры: клавиша символа ищется в текущей раскладке окна
+    /// (раскладка не меняется). Символы, которых в ней нет, — юникодом.
+    Keys,
+}
+
+/// Ввод заготовленного текста в активное окно; в своём потоке, по очереди.
+pub struct Typist {
+    tx: std::sync::mpsc::Sender<(String, TextMode)>,
+}
+
+impl Typist {
+    /// `on_error` вызывается из потока ввода.
+    pub fn new(on_error: impl Fn(String) + Send + 'static) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, TextMode)>();
+        std::thread::Builder::new()
+            .name("escanor-typing".into())
+            .spawn(move || {
+                for (text, mode) in rx {
+                    if let Err(e) = typing::type_text(&text, mode) {
+                        on_error(format!("{e:#}"));
+                    }
+                }
+            })
+            .expect("не удалось создать поток ввода текста");
+        Self { tx }
+    }
+
+    /// Перевод строки нажимает Enter.
+    pub fn type_text(&self, text: &str, mode: TextMode) {
+        let _ = self.tx.send((text.to_string(), mode));
+    }
 }
 
 #[cfg(windows)]
@@ -316,35 +351,6 @@ mod platform {
         submit(&inputs)
     }
 
-    const VK_RETURN: u16 = 0x0D;
-
-    fn unicode(unit: u16, up: bool) -> INPUT {
-        let mut flags = KEYEVENTF_UNICODE;
-        if up {
-            flags |= KEYEVENTF_KEYUP;
-        }
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: unit, dwFlags: flags, time: 0, dwExtraInfo: 0 },
-            },
-        }
-    }
-
-    pub fn type_text(text: &str) -> Result<()> {
-        let mut inputs = Vec::new();
-        for (i, line) in text.split('\n').enumerate() {
-            if i > 0 {
-                // Enter — настоящей клавишей: символ перевода строки понимают не все окна.
-                inputs.extend([input(VK_RETURN, false, false), input(VK_RETURN, false, true)]);
-            }
-            for unit in line.trim_end_matches('\r').encode_utf16() {
-                inputs.extend([unicode(unit, false), unicode(unit, true)]);
-            }
-        }
-        submit(&inputs)
-    }
-
     fn submit(inputs: &[INPUT]) -> Result<()> {
         if inputs.is_empty() {
             return Ok(());
@@ -355,7 +361,107 @@ mod platform {
         }
         Ok(())
     }
+
+    pub(super) mod typing {
+        use super::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY};
+        use super::{VK_LCONTROL, VK_LMENU, VK_LSHIFT, input, submit};
+        use crate::keys::TextMode;
+        use anyhow::Result;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyState, GetKeyboardLayout, HKL, KEYBD_EVENT_FLAGS, MAPVK_VK_TO_VSC, MapVirtualKeyExW, VkKeyScanExW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+        const VK_RETURN: u16 = 0x0D;
+        const VK_CAPITAL: i32 = 0x14;
+
+        /// Весь текст уходит одной пачкой; раскладка окна не меняется.
+        pub fn type_text(text: &str, mode: TextMode) -> Result<()> {
+            let window = unsafe { GetForegroundWindow() };
+            let thread = if window.is_invalid() { 0 } else { unsafe { GetWindowThreadProcessId(window, None) } };
+            let layout = unsafe { GetKeyboardLayout(thread) };
+            // Caps Lock меняет регистр букв: Shift тогда нужен наоборот.
+            let caps = unsafe { GetKeyState(VK_CAPITAL) } & 1 != 0;
+
+            let mut inputs = Vec::new();
+            let mut units = [0u16; 2];
+            for ch in text.chars() {
+                match ch {
+                    '\r' => {}
+                    '\n' => inputs.extend(key_inputs(VK_RETURN, 0, layout)),
+                    _ => {
+                        let units = ch.encode_utf16(&mut units);
+                        let key = if mode == TextMode::Keys { find_key(units, layout) } else { None };
+                        match key {
+                            Some((vk, mods)) => {
+                                let shift = (mods & 1 != 0) != (caps && ch.is_alphabetic());
+                                inputs.extend(key_inputs(vk, (mods & !1) | shift as u8, layout));
+                            }
+                            None => inputs.extend(unicode_inputs(units)),
+                        }
+                    }
+                }
+            }
+            submit(&inputs)
+        }
+
+        /// Клавиша символа в раскладке окна: виртуальный код и модификаторы.
+        fn find_key(units: &[u16], layout: HKL) -> Option<(u16, u8)> {
+            let &[unit] = units else { return None };
+            let scan = unsafe { VkKeyScanExW(unit, layout) };
+            let (vk, mods) = (scan as u16 & 0xFF, (scan as u16 >> 8) as u8);
+            // −1 — символа нет; старшие биты модификаторов (Hankaku и т.п.) так не нажать.
+            (scan != -1 && mods & !0b111 == 0).then_some((vk, mods))
+        }
+
+        /// Нажатие клавиши символа с модификаторами (биты VkKeyScan: 1 — Shift, 2 — Ctrl, 4 — Alt;
+        /// Ctrl+Alt — это AltGr). Скан-код — по раскладке окна, его читают игры с raw input.
+        fn key_inputs(vk: u16, mods: u8, layout: HKL) -> Vec<INPUT> {
+            let modifiers: Vec<u16> = [(1, VK_LSHIFT), (2, VK_LCONTROL), (4, VK_LMENU)]
+                .into_iter()
+                .filter(|&(bit, _)| mods & bit != 0)
+                .map(|(_, vk)| vk)
+                .collect();
+            let scan = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, Some(layout)) } as u16;
+            let key = |up: bool| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        wScan: scan,
+                        dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+            let mut inputs: Vec<INPUT> = modifiers.iter().map(|&m| input(m, false, false)).collect();
+            inputs.extend([key(false), key(true)]);
+            inputs.extend(modifiers.iter().rev().map(|&m| input(m, false, true)));
+            inputs
+        }
+
+        /// Символ юникод-событием: в обычном режиме и для символов, которых нет в раскладке.
+        fn unicode_inputs(units: &[u16]) -> Vec<INPUT> {
+            let event = |unit: u16, up: bool| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: unit,
+                        dwFlags: if up { KEYEVENTF_UNICODE | KEYEVENTF_KEYUP } else { KEYEVENTF_UNICODE },
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+            units.iter().flat_map(|&u| [event(u, false), event(u, true)]).collect()
+        }
+    }
 }
+
+#[cfg(windows)]
+use platform::typing;
 
 #[cfg(not(windows))]
 mod platform {
@@ -365,9 +471,12 @@ mod platform {
     pub fn send(_combo: &KeyCombo, _down: bool) -> Result<()> {
         bail!("нажатие клавиш пока работает только в Windows")
     }
+}
 
-    pub fn type_text(_text: &str) -> Result<()> {
-        bail!("печать текста пока работает только в Windows")
+#[cfg(not(windows))]
+mod typing {
+    pub fn type_text(_text: &str, _mode: super::TextMode) -> anyhow::Result<()> {
+        anyhow::bail!("ввод текста пока работает только в Windows")
     }
 }
 

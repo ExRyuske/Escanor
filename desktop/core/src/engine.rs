@@ -7,7 +7,7 @@ use crate::adb::{self, Adb, AdbDevice, find_apk};
 use crate::audio::{self, AudioOutput, AudioOutputInfo, AudioRing, SharedRing};
 use crate::clock::{ClockOffsets, ClockSync, now_us};
 use crate::keys;
-use crate::macropad::{PadKind, PadLayout};
+use crate::macropad::{PadKind, PadLayout, SoundRef};
 use crate::protocol::{
     AudioParams, AudioStarted, CHANNEL_AUDIO, CHANNEL_CONTROL, CHANNEL_VIDEO, Controls, Devices, MacropadButton,
     MacropadLayout, MacropadPage, MacropadState, PHONE_PORT, PhoneInfo, Request, Response, VERSION, VideoParams,
@@ -58,6 +58,8 @@ pub enum Command {
         normalize: bool,
         volume: f32,
     },
+    /// Прослушать звук кнопки на этом ПК; повторно — остановить.
+    PreviewSound(SoundRef),
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +217,11 @@ struct Engine {
     /// Кнопки макропада, которые сейчас удерживаются (их клавиши нажаты на ПК).
     pad_held: Vec<(usize, usize)>,
     soundpad: Soundpad,
+    /// Ввод заготовленного текста кнопок.
+    typist: keys::Typist,
+    /// Прослушивание звука из редактора кнопки — в системное устройство, а не в устройство
+    /// саундпада: тот часто виртуальный кабель, и пользователь ничего бы не услышал.
+    preview: Soundpad,
 }
 
 impl Engine {
@@ -229,6 +236,9 @@ impl Engine {
             decoder: Mutex::new(None),
         });
         let soundpad = Soundpad::new(events.clone());
+        let preview = Soundpad::new(events.clone());
+        let typing_events = events.clone();
+        let typist = keys::Typist::new(move |e| typing_events(Event::Error(format!("Макропад: {e}"))));
         Self {
             events,
             tx,
@@ -261,6 +271,8 @@ impl Engine {
             phone_macropad: None,
             pad_held: Vec::new(),
             soundpad,
+            typist,
+            preview,
         }
     }
 
@@ -298,6 +310,7 @@ impl Engine {
             self.update_vcam_status();
         }
         self.soundpad.tick();
+        self.preview.tick();
         if self.audio_output.as_ref().is_some_and(|o| !o.is_alive()) {
             // Устройство отключили (гарнитура, USB-карта): открываем заново — системное по умолчанию
             // к этому моменту уже другое; если выбранного больше нет, покажем ошибку.
@@ -410,11 +423,15 @@ impl Engine {
                 }
                 self.release_pad_keys();
                 let sounds = layout.iter().flat_map(|l| &l.pages).flat_map(|p| &p.buttons);
-                self.soundpad.preload(sounds.filter_map(|b| b.sound.clone()).collect());
+                self.soundpad.preload(sounds.filter_map(|b| b.sound.as_ref().map(|s| s.path.clone())).collect());
                 self.macropad = layout;
                 self.send_macropad();
             }
-            Command::SetSoundpad { output, normalize, volume } => self.soundpad.configure(output, normalize, volume),
+            Command::SetSoundpad { output, normalize, volume } => {
+                self.preview.configure(None, normalize, volume);
+                self.soundpad.configure(output, normalize, volume);
+            }
+            Command::PreviewSound(sound) => self.preview.toggle(&sound),
         }
     }
 
@@ -671,8 +688,8 @@ impl Engine {
             return;
         }
         if let Some(text) = &button.text {
-            if down && let Err(e) = keys::type_text(text) {
-                self.emit(Event::Error(format!("Макропад: {e:#}")));
+            if down {
+                self.typist.type_text(text, button.text_mode);
             }
             return;
         }
@@ -977,6 +994,7 @@ mod tests {
             keys: Default::default(),
             launch: None,
             text: text.map(str::to_string),
+            text_mode: Default::default(),
             sound: None,
             states: vec![PadState { label: "A".into(), image_png: Some(vec![1, 2, 3]) }],
             state: 0,
