@@ -6,7 +6,7 @@ use crate::tray::{Tray, TrayCommand};
 use crate::update::{self, Release};
 use escanor_core::adb::AdbDevice;
 use escanor_core::audio::{AudioOutputInfo, looks_virtual};
-use escanor_core::keys::{Key, KeyCombo, TextMode};
+use escanor_core::keys::{Key, KeyCombo};
 use escanor_core::macropad::{Orientation, PadButton, PadKind, PadLayout, PadPage, PadState, SoundRef};
 use escanor_core::protocol::{
     AudioParams, AudioStarted, CameraInfo, Controls, Devices, PhoneInfo, VideoParams, VideoStarted,
@@ -126,8 +126,6 @@ pub enum Message {
     PadSnippet(text_editor::Action),
     /// Нажимать Enter после текста.
     PadEnter(bool),
-    /// Способ ввода текста кнопки.
-    PadTextMode(TextMode),
     /// Файл для кнопки-звука.
     PadPickSound,
     PadSoundPicked(Option<PathBuf>),
@@ -485,11 +483,19 @@ impl App {
                 self.update = UpdateState::Installing(release.clone());
                 background(move || update::install(&release).map_err(|e| format!("{e:#}")), Message::UpdateInstalled)
             }
-            Message::UpdateInstalled(Ok(())) => {
-                // Значок трея убирается до выхода, иначе он «висит» до наведения мыши.
-                self.tray = None;
-                update::restart()
-            }
+            Message::UpdateInstalled(Ok(())) => match update::start_new_version() {
+                Ok(()) => {
+                    // Значок трея убирается до выхода, иначе он «висит» до наведения мыши.
+                    self.tray = None;
+                    std::process::exit(0)
+                }
+                Err(e) => {
+                    self.update = UpdateState::Failed(format!(
+                        "Обновление установлено, но новая версия не запустилась ({e:#}) — перезапустите Escanor"
+                    ));
+                    Task::none()
+                }
+            },
             other => {
                 self.apply(other);
                 Task::none()
@@ -806,12 +812,6 @@ impl App {
             Message::PadEnter(on) => {
                 if let Some(b) = self.selected_button_mut() {
                     b.enter = on;
-                }
-                self.apply_pad();
-            }
-            Message::PadTextMode(mode) => {
-                if let Some(b) = self.selected_button_mut() {
-                    b.text_mode = mode;
                 }
                 self.apply_pad();
             }
@@ -1405,7 +1405,6 @@ impl App {
                 keys: b.keys,
                 launch,
                 text,
-                text_mode: b.text_mode,
                 sound,
                 states,
                 state: if b.toggle { b.state } else { 0 },
@@ -1938,11 +1937,6 @@ mod tests {
 
         let _ = app.update(Message::PadEnter(true));
         assert_eq!(sent(&app)[0].text.as_deref(), Some("Всем\nпривет!\n"), "Enter в конце");
-        assert_eq!(sent(&app)[0].text_mode, TextMode::Unicode, "по умолчанию — как раньше");
-        let _ = app.update(Message::PadTextMode(TextMode::Keys));
-        assert_eq!(sent(&app)[0].text_mode, TextMode::Keys);
-        let old: ButtonSettings = serde_json::from_str(r#"{"text": true, "snippet": "gg"}"#).unwrap();
-        assert_eq!(old.text_mode, TextMode::Unicode, "старые настройки открываются обычным способом");
 
         // Выбрали другую кнопку — поле показывает её текст.
         app.select(1);

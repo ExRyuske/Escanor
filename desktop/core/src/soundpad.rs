@@ -34,8 +34,17 @@ const CACHE_BYTES: usize = 128 << 20;
 const MAX_SECONDS: usize = 600;
 /// Сколько звуков играет одновременно; следующий вытесняет самый старый.
 const MAX_VOICES: usize = 16;
-/// Тише этого пика (−45 dBFS) край звука считается тишиной.
-const SILENCE_PEAK: f32 = 0.0056;
+/// Окно, по которому считается громкость при поиске тишины по краям.
+const WINDOW_MS: usize = 5;
+/// Начало звука — где он не больше чем на столько тише самого громкого места и не тише порога.
+const START_BELOW_DB: f64 = 45.0;
+const START_FLOOR_DB: f64 = -50.0;
+/// Конец звука — мягче: затухание длинное и тихое.
+const END_BELOW_DB: f64 = 50.0;
+const END_FLOOR_DB: f64 = -65.0;
+/// Всплеск короче этого, отделённый от звука паузой не короче `CLICK_GAP_MS`, — щелчок, а не звук.
+const MIN_SOUND_RUN_MS: usize = 20;
+const CLICK_GAP_MS: usize = 50;
 /// Запас при обрезке тишины: перед атакой и после затухания.
 const TRIM_PAD_BEFORE_MS: u32 = 10;
 const TRIM_PAD_AFTER_MS: u32 = 50;
@@ -73,6 +82,47 @@ impl Clip {
         (frame(sound.start_ms).min(end), end)
     }
 
+    /// Где звук начинается и заканчивается, в кадрах; `None` — звука нет.
+    ///
+    /// Громкость — RMS по окнам в 5 мс. Начало — первое место громче −50 dBFS: слабый шум и
+    /// затухающий хвост перед звуком — ещё тишина, а тихие щелчки перед громким звуком — уже звук.
+    /// Конец ищется мягче (до −65 dBFS): тихое затухание после выравнивания громкости слышно,
+    /// и срезать его нельзя. Короткий щелчок, отделённый от звука паузой, краем звука не считается.
+    fn content_frames(&self) -> Option<(usize, usize)> {
+        let frames = self.frames();
+        let window = (self.rate as usize * WINDOW_MS / 1000).max(1);
+        let levels: Vec<f64> = (0..frames.div_ceil(window))
+            .map(|w| {
+                let part = &self.samples[w * window * self.channels..((w + 1) * window).min(frames) * self.channels];
+                (part.iter().map(|&s| s as f64 * s as f64).sum::<f64>() / part.len() as f64).sqrt() / 32768.0
+            })
+            .collect();
+        let loudest = levels.iter().copied().fold(0.0, f64::max);
+        let db = |value: f64| 10f64.powf(value / 20.0);
+        // Пороги не выше «на 10 дБ тише пика»: иначе у очень тихой записи не нашлось бы ничего.
+        let start_level = (loudest * db(-START_BELOW_DB)).max(db(START_FLOOR_DB)).min(loudest * db(-10.0));
+        let end_level = (loudest * db(-END_BELOW_DB)).max(db(END_FLOOR_DB)).min(loudest * db(-10.0));
+        if loudest < db(END_FLOOR_DB) {
+            return None;
+        }
+        let min_run = MIN_SOUND_RUN_MS.div_ceil(WINDOW_MS);
+        let min_gap = CLICK_GAP_MS.div_ceil(WINDOW_MS);
+        let isolated_click = |run: (usize, usize), neighbour: (usize, usize)| {
+            run.1 - run.0 < min_run && run.0.max(neighbour.0) - run.1.min(neighbour.1) >= min_gap
+        };
+
+        let mut starts = runs(&levels, start_level);
+        while starts.len() > 1 && isolated_click(starts[0], starts[1]) {
+            starts.remove(0);
+        }
+        let mut ends = runs(&levels, end_level);
+        while ends.len() > 1 && isolated_click(ends[ends.len() - 1], ends[ends.len() - 2]) {
+            ends.pop();
+        }
+        let (first, last) = (starts.first()?.0, ends.last()?.1);
+        (last > first).then(|| (first * window, (last * window).min(frames)))
+    }
+
     fn info(&self, buckets: usize) -> SoundInfo {
         let ms = |frame: usize| (frame as u64 * 1000 / self.rate as u64) as u32;
         let frames = self.frames();
@@ -81,19 +131,31 @@ impl Clip {
         };
         let peaks =
             (0..buckets).map(|i| peak(frames * i / buckets, frames * (i + 1) / buckets) as f32 / 32768.0).collect();
-        // Края без звука — по окнам в 10 мс, тише порога. Немного запаса, чтобы не срезать атаку и затухание.
-        let window = (self.rate as usize / 100).max(1);
-        let loud = |w: usize| peak(w * window, ((w + 1) * window).min(frames)) as f32 / 32768.0 > SILENCE_PEAK;
-        let windows = frames.div_ceil(window);
-        let content = match ((0..windows).find(|&w| loud(w)), (0..windows).rev().find(|&w| loud(w))) {
-            (Some(first), Some(last)) => (
-                ms(first * window).saturating_sub(TRIM_PAD_BEFORE_MS),
-                (ms(((last + 1) * window).min(frames)) + TRIM_PAD_AFTER_MS).min(ms(frames)),
-            ),
-            _ => (0, ms(frames)),
-        };
+        let content = self.content_frames().map_or((0, ms(frames)), |(first, last)| {
+            (ms(first).saturating_sub(TRIM_PAD_BEFORE_MS), (ms(last) + TRIM_PAD_AFTER_MS).min(ms(frames)))
+        });
         SoundInfo { duration_ms: ms(frames), peaks, content_ms: content }
     }
+}
+
+/// Отрезки подряд идущих окон громче `level`: `[начало, конец)` в окнах.
+fn runs(levels: &[f64], level: f64) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (w, &value) in levels.iter().enumerate() {
+        match (value > level, start) {
+            (true, None) => start = Some(w),
+            (false, Some(s)) => {
+                runs.push((s, w));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        runs.push((s, levels.len()));
+    }
+    runs
 }
 
 /// Звук для редактора кнопки: длительность, волна и где он начинается и заканчивается без тишины.
@@ -148,7 +210,11 @@ pub fn decode(path: &Path) -> Result<Clip> {
                 (channels, rate) = spec;
                 chunk.resize(buffer.samples_interleaved(), 0i16);
                 buffer.copy_to_slice_interleaved(&mut chunk);
-                samples.extend_from_slice(&chunk);
+                // Задержка и добивка кодировщика (у mp3 — десятки миллисекунд мусора в начале) не звук.
+                let decoded = chunk.len() / channels;
+                let skip = (packet.trim_start.get() as usize).min(decoded);
+                let keep = decoded - skip - (packet.trim_end.get() as usize).min(decoded - skip);
+                samples.extend_from_slice(&chunk[skip * channels..(skip + keep) * channels]);
                 let limit = MAX_SECONDS * rate as usize * channels;
                 if samples.len() >= limit {
                     samples.truncate(limit);
@@ -698,6 +764,28 @@ mod tests {
         let click = Arc::new(super::Clip::new(with_click, 1, 48_000));
         let cut = SoundRef { path: "c".into(), start_ms: 0, end_ms: Some(1000) };
         assert!(Voice::new(&cut, click.clone(), true).gain > Voice::new(&whole("c"), click, true).gain);
+    }
+
+    #[test]
+    fn click_before_sound_is_not_its_start_and_quiet_tail_stays() {
+        // 10 мс щелчка, 150 мс тишины, 200 мс звука, затухание на −55 dBFS 200 мс, тишина.
+        let mut samples = tone(0.3, 480);
+        samples.extend(vec![0; 7_200]);
+        samples.extend(tone(0.5, 9_600));
+        samples.extend(tone(0.0025, 9_600));
+        samples.extend(vec![0; 9_600]);
+        let (start, end) = clip(samples).info(10).content_ms;
+        assert!((150..=160).contains(&start), "щелчок в начале — не начало звука: {start}");
+        assert!((550..=620).contains(&end), "тихое затухание не срезано: {end}");
+    }
+
+    #[test]
+    fn faint_noise_before_quiet_sound_is_silence() {
+        // Вся запись тихая (−33 dBFS), перед звуком — шум на −56 dBFS.
+        let mut samples = tone(0.0022, 4_800);
+        samples.extend(tone(0.03, 4_800));
+        let (start, _) = clip(samples).info(10).content_ms;
+        assert!((90..=100).contains(&start), "слабый шум перед звуком срезается: {start}");
     }
 
     #[test]

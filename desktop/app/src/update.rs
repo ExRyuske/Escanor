@@ -20,6 +20,8 @@ pub const UPDATED_ARG: &str = "--updated";
 
 /// Суффикс для файлов, которые заменены обновлением, но ещё заняты работающей программой.
 const OLD: &str = "old";
+/// Суффикс для новых файлов, пока они не встали на место старых.
+const NEW: &str = "new";
 /// Пакет больше не бывает: защита от бесконечной загрузки.
 const MAX_PACKAGE: u64 = 300 * 1024 * 1024;
 
@@ -89,7 +91,7 @@ fn is_newer(candidate: &str, current: &str) -> bool {
 }
 
 /// Скачивает пакет, проверяет его и раскладывает по папке программы.
-/// После успеха нужно перезапуститься (`restart`).
+/// После успеха нужно запустить новую версию (`start_new_version`) и завершиться.
 pub fn install(release: &Release) -> Result<()> {
     if !cfg!(windows) {
         bail!("пакет обновления собирается только для Windows");
@@ -110,38 +112,85 @@ pub fn install(release: &Release) -> Result<()> {
     }
 
     let mut archive = zip::ZipArchive::new(Cursor::new(package)).context("пакет не zip")?;
+    let mut files = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         if entry.is_dir() {
             continue;
         }
         let Some(relative) = entry.enclosed_name() else { continue };
-        let target = dir.join(relative);
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data)?;
+        files.push((dir.join(relative), data));
+    }
+    replace_all(&files)
+}
+
+/// Кладёт новые файлы на место старых целиком или никак: при сбое посередине не остаётся
+/// смеси двух версий и нет пропавшего exe.
+///
+/// Сначала всё записывается рядом (`.new`) — сбой здесь рабочих файлов не касается. Потом
+/// подмена: запущенный exe (и adb, если его держит сервер) нельзя перезаписать, но можно
+/// переименовать — старый файл уходит в `.old`, новый встаёт на его место. Не вышло — всё
+/// уже подменённое возвращается обратно.
+fn replace_all(files: &[(PathBuf, Vec<u8>)]) -> Result<()> {
+    let written = files.iter().try_for_each(|(target, data)| {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut data = Vec::new();
-        entry.read_to_end(&mut data)?;
-        replace(&target, &data).with_context(|| format!("не удалось заменить {}", target.display()))?;
+        std::fs::write(side_path(target, NEW), data)
+            .with_context(|| format!("не удалось записать {}", target.display()))
+    });
+    if let Err(e) = written {
+        for (target, _) in files {
+            let _ = std::fs::remove_file(side_path(target, NEW));
+        }
+        return Err(e);
+    }
+
+    let mut swapped: Vec<(&Path, bool)> = Vec::new();
+    for (target, _) in files {
+        match swap(target) {
+            Ok(had_old) => swapped.push((target, had_old)),
+            Err(e) => {
+                for &(target, had_old) in swapped.iter().rev() {
+                    let _ = std::fs::remove_file(target);
+                    if had_old {
+                        let _ = std::fs::rename(side_path(target, OLD), target);
+                    }
+                }
+                for (target, _) in files {
+                    let _ = std::fs::remove_file(side_path(target, NEW));
+                }
+                return Err(e).with_context(|| format!("не удалось заменить {}", target.display()));
+            }
+        }
     }
     Ok(())
 }
 
-/// Запущенный exe (и adb, если его держит сервер) нельзя перезаписать, но можно
-/// переименовать: старый файл уходит в `.old`, новый ложится на его место.
-fn replace(target: &Path, data: &[u8]) -> std::io::Result<()> {
-    if target.exists() {
-        let old = old_path(target);
+/// Ставит `.new` на место файла; прежний уходит в `.old`. `true` — прежний был.
+fn swap(target: &Path) -> std::io::Result<bool> {
+    let (new, old) = (side_path(target, NEW), side_path(target, OLD));
+    let had_old = target.exists();
+    if had_old {
         let _ = std::fs::remove_file(&old);
         std::fs::rename(target, &old)?;
     }
-    std::fs::write(target, data)
+    if let Err(e) = std::fs::rename(&new, target) {
+        if had_old {
+            let _ = std::fs::rename(&old, target);
+        }
+        return Err(e);
+    }
+    Ok(had_old)
 }
 
-fn old_path(path: &Path) -> PathBuf {
+/// `escanor.exe` → `escanor.exe.old` / `escanor.exe.new`.
+fn side_path(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".");
-    name.push(OLD);
+    name.push(suffix);
     path.with_file_name(name)
 }
 
@@ -156,17 +205,17 @@ fn program_dir() -> Result<PathBuf> {
     Ok(exe()?.parent().context("нет папки программы")?.to_path_buf())
 }
 
-/// Запускает новую версию и завершает текущую.
-pub fn restart() -> ! {
+/// Запускает новую версию; текущей после успеха нужно завершиться. Новая дождётся её выхода.
+/// Если запустить не вышло (например, помешал антивирус), текущая должна продолжить работу —
+/// иначе не осталось бы ни одной.
+pub fn start_new_version() -> Result<()> {
     // Сервер adb запущен из папки программы: пока он работает, старый adb.exe не удалить.
     escanor_core::adb::Adb::locate().kill_server();
-    if let Ok(exe) = exe() {
-        let mut args: Vec<String> =
-            std::env::args().skip(1).filter(|a| a != crate::system::TRAY_ARG && a != UPDATED_ARG).collect();
-        args.push(UPDATED_ARG.into());
-        let _ = std::process::Command::new(exe).args(args).spawn();
-    }
-    std::process::exit(0)
+    let mut args: Vec<String> =
+        std::env::args().skip(1).filter(|a| a != crate::system::TRAY_ARG && a != UPDATED_ARG).collect();
+    args.push(UPDATED_ARG.into());
+    std::process::Command::new(exe()?).args(args).spawn().context("не удалось запустить новую версию")?;
+    Ok(())
 }
 
 /// Удаляет файлы, оставшиеся от прошлого обновления. Сразу после обновления старая версия ещё
@@ -186,12 +235,13 @@ pub fn cleanup(after_update: bool) {
     });
 }
 
-/// `true` — ни одного `.old` не осталось.
+/// `true` — ни одного `.old` (и недописанного `.new`) не осталось.
 fn remove_old_files(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else { return true };
     let mut clean = true;
     for entry in entries.flatten() {
-        if entry.path().extension().is_some_and(|e| e == OLD) && std::fs::remove_file(entry.path()).is_err() {
+        if entry.path().extension().is_some_and(|e| e == OLD || e == NEW) && std::fs::remove_file(entry.path()).is_err()
+        {
             clean = false;
         }
     }
@@ -212,6 +262,40 @@ mod tests {
     }
 
     #[test]
+    fn replaces_all_files_or_none() {
+        let dir = std::env::temp_dir().join("escanor-replace-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("escanor.exe"), b"old exe").unwrap();
+        std::fs::write(dir.join("adb.exe"), b"old adb").unwrap();
+        let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+
+        replace_all(&[(dir.join("escanor.exe"), b"new exe".to_vec()), (dir.join("app.apk"), b"apk".to_vec())]).unwrap();
+        assert_eq!(read("escanor.exe"), b"new exe");
+        assert_eq!(read("escanor.exe.old"), b"old exe", "старый exe ждёт удаления после перезапуска");
+        assert_eq!(read("app.apk"), b"apk");
+
+        // Второй файл не встаёт на место: старую копию некуда убрать (на месте `.old` — непустая
+        // папка). Первый уже подменённый файл возвращается как был.
+        std::fs::write(dir.join("blocked"), b"old").unwrap();
+        std::fs::create_dir_all(dir.join("blocked.old")).unwrap();
+        std::fs::write(dir.join("blocked.old").join("x"), b"").unwrap();
+        let result = replace_all(&[(dir.join("adb.exe"), b"new adb".to_vec()), (dir.join("blocked"), b"new".to_vec())]);
+        assert!(result.is_err());
+        assert_eq!(read("adb.exe"), b"old adb", "откат: прежний файл на месте");
+        assert_eq!(read("blocked"), b"old");
+        assert!(!dir.join("adb.exe.new").exists() && !dir.join("blocked.new").exists(), "недописанное убрано");
+
+        // Запись не удалась ещё до подмены — рабочие файлы не тронуты вовсе.
+        std::fs::write(dir.join("file"), b"").unwrap();
+        let result = replace_all(&[(dir.join("adb.exe"), b"x".to_vec()), (dir.join("file").join("y"), b"y".to_vec())]);
+        assert!(result.is_err());
+        assert_eq!(read("adb.exe"), b"old adb");
+        assert!(!dir.join("adb.exe.new").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn removes_only_old_files() {
         let dir = std::env::temp_dir().join("escanor-update-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -227,6 +311,6 @@ mod tests {
 
     #[test]
     fn old_file_names() {
-        assert_eq!(old_path(Path::new("C:/Escanor/escanor.exe")), PathBuf::from("C:/Escanor/escanor.exe.old"));
+        assert_eq!(side_path(Path::new("C:/Escanor/escanor.exe"), OLD), PathBuf::from("C:/Escanor/escanor.exe.old"));
     }
 }

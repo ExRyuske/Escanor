@@ -15,6 +15,15 @@ pub const VCAM_CLSID: u128 = 0x411C5F8F_DE2E_4C57_817F_FB1C321CA459;
 pub const VCAM_CLSID_STR: &str = "{411C5F8F-DE2E-4C57-817F-FB1C321CA459}";
 pub const VCAM_FRIENDLY_NAME: &str = "Escanor Camera";
 
+/// Ревизия камеры, записанная в файл DLL (`ESCANOR-VCAM-REVISION:<хеш>;`); `None` — метки нет
+/// (DLL старше этой метки).
+pub fn vcam_revision(dll: &[u8]) -> Option<&[u8]> {
+    const MARKER: &[u8] = b"ESCANOR-VCAM-REVISION:";
+    let start = dll.windows(MARKER.len()).position(|w| w == MARKER)? + MARKER.len();
+    let length = dll[start..].iter().take(32).position(|&b| b == b';')?;
+    Some(&dll[start..start + length])
+}
+
 pub const MAGIC: u32 = u32::from_le_bytes(*b"ESCV");
 pub const VERSION: u32 = 1;
 pub const MAX_WIDTH: u32 = 3840;
@@ -308,6 +317,14 @@ mod tests {
         let info = frames.read_latest(info.counter, &mut dst).unwrap();
         assert_eq!((info.width, info.height, info.counter), (2, 2, 2));
         assert_eq!(dst, [7; 6]);
+    }
+
+    #[test]
+    fn finds_vcam_revision() {
+        let dll = b"MZ...ESCANOR-VCAM-REVISION:0123abcd;...".to_vec();
+        assert_eq!(vcam_revision(&dll), Some(&b"0123abcd"[..]));
+        assert_eq!(vcam_revision(b"MZ without marker"), None);
+        assert_eq!(vcam_revision(b"ESCANOR-VCAM-REVISION:no-end"), None);
     }
 
     #[test]

@@ -217,8 +217,6 @@ struct Engine {
     /// Кнопки макропада, которые сейчас удерживаются (их клавиши нажаты на ПК).
     pad_held: Vec<(usize, usize)>,
     soundpad: Soundpad,
-    /// Ввод заготовленного текста кнопок.
-    typist: keys::Typist,
     /// Прослушивание звука из редактора кнопки — в системное устройство, а не в устройство
     /// саундпада: тот часто виртуальный кабель, и пользователь ничего бы не услышал.
     preview: Soundpad,
@@ -237,8 +235,6 @@ impl Engine {
         });
         let soundpad = Soundpad::new(events.clone());
         let preview = Soundpad::new(events.clone());
-        let typing_events = events.clone();
-        let typist = keys::Typist::new(move |e| typing_events(Event::Error(format!("Макропад: {e}"))));
         Self {
             events,
             tx,
@@ -271,7 +267,6 @@ impl Engine {
             phone_macropad: None,
             pad_held: Vec::new(),
             soundpad,
-            typist,
             preview,
         }
     }
@@ -688,8 +683,8 @@ impl Engine {
             return;
         }
         if let Some(text) = &button.text {
-            if down {
-                self.typist.type_text(text, button.text_mode);
+            if down && let Err(e) = keys::type_text(text) {
+                self.emit(Event::Error(format!("Макропад: {e:#}")));
             }
             return;
         }
@@ -994,7 +989,6 @@ mod tests {
             keys: Default::default(),
             launch: None,
             text: text.map(str::to_string),
-            text_mode: Default::default(),
             sound: None,
             states: vec![PadState { label: "A".into(), image_png: Some(vec![1, 2, 3]) }],
             state: 0,

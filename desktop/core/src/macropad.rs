@@ -66,7 +66,6 @@ pub struct PadButton {
     pub launch: Option<String>,
     /// Заготовленный текст: касание печатает его на ПК вместо нажатия клавиш.
     pub text: Option<String>,
-    pub text_mode: crate::keys::TextMode,
     /// Звуковой файл: касание проигрывает его на ПК (саундпад).
     pub sound: Option<SoundRef>,
     /// Одно состояние у обычной кнопки и папки, два — у переключателя.

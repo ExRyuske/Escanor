@@ -262,11 +262,21 @@ mod win {
             return Installation::Outdated;
         }
         if let Some(bundled) = bundled_dll()
-            && std::fs::read(&bundled).ok() != std::fs::read(&target).ok()
+            && !same_camera(&bundled, &target)
         {
             return Installation::Outdated;
         }
         Installation::Current
+    }
+
+    /// Одна ли это камера. Файлы DLL отличаются при каждой сборке, поэтому сравнивается ревизия —
+    /// хеш исходников камеры; у DLL без неё (старых версий) — файлы целиком.
+    fn same_camera(bundled: &std::path::Path, installed: &std::path::Path) -> bool {
+        let (Ok(a), Ok(b)) = (std::fs::read(bundled), std::fs::read(installed)) else { return false };
+        match (escanor_shm::vcam_revision(&a), escanor_shm::vcam_revision(&b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => a == b,
+        }
     }
 
     /// Последняя строка журнала DLL (%ProgramData%\\Escanor\\vcam.log).

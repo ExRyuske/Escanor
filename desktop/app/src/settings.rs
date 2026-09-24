@@ -2,7 +2,7 @@
 //! Файл settings.json и папка macropad лежат рядом с программой.
 
 use anyhow::{Context, Result};
-use escanor_core::keys::{KeyCombo, TextMode};
+use escanor_core::keys::KeyCombo;
 use escanor_core::macropad::{Amoled, Orientation};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -195,8 +195,6 @@ pub struct ButtonSettings {
     pub text: bool,
     pub snippet: String,
     pub enter: bool,
-    /// Способ ввода: юникодом (как раньше) или настоящими клавишами.
-    pub text_mode: TextMode,
     /// Звук: касание проигрывает на ПК файл `sound_file` из папки макропада — отрезок
     /// от `sound_start_ms` до `sound_end_ms` (`None` — до конца). Сам файл не меняется.
     pub sound: bool,
@@ -219,7 +217,6 @@ impl Default for ButtonSettings {
             text: false,
             snippet: String::new(),
             enter: false,
-            text_mode: TextMode::default(),
             sound: false,
             sound_file: String::new(),
             sound_start_ms: 0,

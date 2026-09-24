@@ -6,6 +6,10 @@
 
 pub mod scale;
 
+/// Метка ревизии в самом файле DLL: по ней приложение понимает, изменилась ли камера.
+#[used]
+static REVISION: &str = concat!("ESCANOR-VCAM-REVISION:", env!("ESCANOR_VCAM_REVISION"), ";");
+
 #[cfg(windows)]
 mod activator;
 #[cfg(windows)]

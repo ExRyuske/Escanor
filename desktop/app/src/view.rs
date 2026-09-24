@@ -7,7 +7,7 @@ use crate::app::{
 };
 use crate::settings::{ButtonSettings, SOUND_MUTE_DB, TOGGLE_STATES};
 use crate::style::{self, Tone};
-use escanor_core::keys::{Key, KeyCombo, TextMode};
+use escanor_core::keys::{Key, KeyCombo};
 use escanor_core::macropad::{Amoled, Orientation};
 use escanor_core::vcam::VcamStatus;
 use iced::font::Weight;
@@ -857,7 +857,7 @@ fn button_editor(app: &App) -> Element<'_, Message> {
     } else if b.sound {
         "Касание проигрывает звук на ПК в устройство, выбранное в блоке «Звуки»; повторное — останавливает."
     } else if b.text {
-        "Касание набирает заготовленный текст в активном окне на ПК — как будто его напечатали на клавиатуре."
+        "Касание печатает заготовленный текст в активное окно на ПК."
     } else if b.toggle {
         "Нажатие отправляет сочетание и переключает кнопку на другое состояние — со своей картинкой и подписью."
     } else {
@@ -993,7 +993,11 @@ fn button_editor(app: &App) -> Element<'_, Message> {
 
     if b.text {
         let snippet = column![
-            titled("Что набирать", "Текст набирается в окне, где сейчас курсор; перевод строки нажимает Enter.",),
+            titled(
+                "Что печатать",
+                "Текст печатается в окно, где сейчас курсор, — с любыми символами и эмодзи, при любой раскладке. \
+                 Каждый перевод строки нажимает Enter.",
+            ),
             text_editor(&app.snippet_editor)
                 .placeholder("Например: Всем привет!")
                 .style(style::editor)
@@ -1001,17 +1005,6 @@ fn button_editor(app: &App) -> Element<'_, Message> {
                 .height(96)
                 .size(14),
             switch("Нажать Enter в конце", b.enter, Message::PadEnter),
-            field_tip(
-                "Способ ввода",
-                "«Обычный» печатает любые символы, включая эмодзи, — для мессенджеров и браузера. \
-                 «Клавишами» — если в игре или программе вместо букв появляются «?»: нажимает настоящие \
-                 клавиши текущей раскладки, поэтому перед вводом включите нужный язык.",
-                segmented(
-                    &[(TextMode::Unicode, "Обычный"), (TextMode::Keys, "Клавишами")],
-                    b.text_mode,
-                    Message::PadTextMode,
-                ),
-            ),
         ]
         .spacing(12);
         return column![panel(kind), panel(look), panel(snippet)].spacing(14).into();
