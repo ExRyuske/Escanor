@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
 
 pub const PHONE_PORT: u16 = 27183;
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 pub const CHANNEL_CONTROL: u8 = 1;
 pub const CHANNEL_VIDEO: u8 = 2;
@@ -33,6 +33,10 @@ pub enum Request {
     StopVideo,
     RequestKeyframe,
     SetControls(Controls),
+    /// Ориентация макропада: по ней поворачиваются кадры камеры, даже когда макропад не показан.
+    VideoOrientation {
+        orientation: crate::macropad::Orientation,
+    },
     StartAudio(AudioParams),
     StopAudio,
     /// Показать макропад на экране телефона.
@@ -152,6 +156,10 @@ pub enum Response {
         channel: String,
     },
     VideoStarted(VideoStarted),
+    /// Поворот изменился: на сколько градусов по часовой стрелке поворачивать кадры.
+    VideoRotation {
+        rotation: u32,
+    },
     VideoStopped,
     VideoError {
         message: String,
@@ -226,6 +234,9 @@ pub struct VideoStarted {
     pub fps: u32,
     pub encoder: String,
     pub timestamp_source: String,
+    /// На сколько градусов по часовой стрелке повернуть кадр, чтобы он стоял прямо (0, 90, 180, 270).
+    #[serde(default)]
+    pub rotation: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -284,6 +295,10 @@ mod tests {
         let json = serde_json::to_string(&Request::Macropad(layout)).unwrap();
         assert!(json.contains(r#""orientation":"reverse_landscape""#), "{json}");
         assert!(json.contains(r#""amoled":{"dim_after_secs":30,"dim_brightness":10}"#), "{json}");
+        let json =
+            serde_json::to_string(&Request::VideoOrientation { orientation: crate::macropad::Orientation::Landscape })
+                .unwrap();
+        assert_eq!(json, r#"{"type":"video_orientation","orientation":"landscape"}"#);
     }
 
     #[test]
@@ -295,6 +310,8 @@ mod tests {
         let r: Response =
             serde_json::from_str(r#"{"type":"audio_started","sample_rate":48000,"channels":1,"device":null}"#).unwrap();
         assert!(matches!(r, Response::AudioStarted(AudioStarted { sample_rate: 48000, .. })));
+        let r: Response = serde_json::from_str(r#"{"type":"video_rotation","rotation":90}"#).unwrap();
+        assert!(matches!(r, Response::VideoRotation { rotation: 90 }));
     }
 
     #[test]

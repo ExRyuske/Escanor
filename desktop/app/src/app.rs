@@ -727,18 +727,11 @@ impl App {
                 self.pad.enabled = on;
                 self.apply_pad();
             }
-            Message::PadColumns(n) => {
-                self.pad.columns = n;
-                self.resize_pad();
-                self.apply_pad();
-            }
-            Message::PadRows(n) => {
-                self.pad.rows = n;
-                self.resize_pad();
-                self.apply_pad();
-            }
+            Message::PadColumns(n) => self.set_grid(n, self.pad.rows),
+            Message::PadRows(n) => self.set_grid(self.pad.columns, n),
             Message::PadOrientation(orientation) => {
                 self.pad.orientation = orientation;
+                self.send(Command::SetOrientation(orientation));
                 self.apply_pad();
             }
             Message::PadDim(choice) => {
@@ -984,6 +977,7 @@ impl App {
             awb_lock: Some(self.awb_lock),
         }));
         self.apply_soundpad();
+        self.send(Command::SetOrientation(self.pad.orientation));
         self.apply_pad();
     }
 
@@ -1071,6 +1065,18 @@ impl App {
         if let Some(b) = self.selected_button_mut() {
             change(&mut b.keys);
         }
+        self.apply_pad();
+    }
+
+    /// Меняет размер сетки. Открытая папка и выбранная кнопка переезжают вместе с кнопками.
+    fn set_grid(&mut self, columns: u32, rows: u32) {
+        let (from, to, count) = (self.pad.columns as usize, columns as usize, (columns * rows) as usize);
+        let moved = |i: usize| Some(i / from * to + i % from).filter(|&j| i % from < to && j < count);
+        let kept: Vec<usize> = self.pad_path.iter().map_while(|&i| moved(i)).collect();
+        self.pad_selected = if kept.len() == self.pad_path.len() { moved(self.pad_selected).unwrap_or(0) } else { 0 };
+        self.pad_path = kept;
+        self.pad.set_grid(columns, rows);
+        self.resize_pad();
         self.apply_pad();
     }
 
@@ -2060,6 +2066,19 @@ mod tests {
         let _ = app.update(Message::PadRows(1));
         assert!(app.pad_path.is_empty(), "папки больше нет — показываем корень");
         assert_eq!(app.pad_page().len(), 3);
+    }
+
+    #[test]
+    fn growing_grid_keeps_open_folder_and_selection() {
+        let mut app = app_with_labels(&["A", "B", "C", "D", "E"]);
+        app.pad.buttons[5].folder = true;
+        app.pad.resize();
+        let _ = app.update(Message::PadOpen(5));
+        let _ = app.update(Message::PadDragStart(4));
+        let _ = app.update(Message::PadColumns(4));
+        assert_eq!(app.pad_path, [6], "папка из второй строки переехала вместе со строкой");
+        assert!(app.pad_page().len() == 8 && app.is_back(0));
+        assert_eq!(app.pad_selected, 5, "выбор остался на той же ячейке");
     }
 
     #[test]

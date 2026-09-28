@@ -10,6 +10,7 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.hardware.display.DisplayManager
 import android.media.MediaCodec
 import android.media.MediaCodecInfo.CodecProfileLevel
 import android.media.MediaFormat
@@ -19,12 +20,15 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.util.Range
+import android.view.Display
+import android.view.OrientationEventListener
 import android.view.Surface
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 data class VideoConfig(
     val cameraId: String,
@@ -56,15 +60,31 @@ class VideoStreamer(context: Context) {
 
     interface Listener {
         fun onVideoStarted(info: JSONObject)
+        /** Поворот изменился: кадры нужно поворачивать на `rotation` градусов по часовой стрелке. */
+        fun onVideoRotation(rotation: Int)
         fun onVideoError(message: String)
     }
 
     private val cameraManager = context.getSystemService(CameraManager::class.java)
+    private val displays = context.getSystemService(DisplayManager::class.java)
     private val thread = HandlerThread("escanor-camera").apply { start() }
     private val handler = Handler(thread.looper)
     private val executor = Executor { handler.post(it) }
 
     private val controls = CameraControls()
+
+    /**
+     * Кадр поворачивается так же, как экран макропада: по той же настройке ориентации, даже когда
+     * макропад не показан. «Как повёрнут телефон» — по датчику, как SCREEN_ORIENTATION_FULL_SENSOR,
+     * без оглядки на блокировку поворота. Кодировщик поворачивать кадры не умеет, поэтому поворот
+     * сообщается ПК.
+     */
+    private val tilt = object : OrientationEventListener(context) {
+        override fun onOrientationChanged(degrees: Int) {
+            // Телефон лежит плашмя — оставляем прежний поворот.
+            if (degrees != ORIENTATION_UNKNOWN) handler.post { onTilt(degrees) }
+        }
+    }
 
     // Поля ниже трогаются только на потоке handler.
     private var generation = 0
@@ -77,12 +97,28 @@ class VideoStreamer(context: Context) {
     private var characteristics: CameraCharacteristics? = null
     private var drain: DrainThread? = null
 
+    /** Ориентация макропада: `auto`, `portrait`, `landscape`, `reverse_portrait`, `reverse_landscape`. */
+    private var orientation = "auto"
+    /** Поворот экрана, как его повернул бы макропад: 0, 90, 180 или 270 (Surface.ROTATION_* × 90). */
+    private var screenRotation = 0
+    private var followTilt = false
+    /** Поворот кадра, последний сообщённый ПК. */
+    private var rotation = 0
+
     fun start(config: VideoConfig, out: PacketWriter, listener: Listener) = handler.post {
         stopInternal()
         startInternal(config, out, listener)
     }
 
     fun stop() = handler.post { stopInternal() }
+
+    fun setOrientation(name: String) = handler.post {
+        orientation = name
+        if (session != null) {
+            followOrientation()
+            updateRotation()
+        }
+    }
 
     fun requestKeyframe() = handler.post {
         codec?.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
@@ -110,6 +146,7 @@ class VideoStreamer(context: Context) {
         try {
             val chars = cameraManager.getCameraCharacteristics(config.cameraId)
             characteristics = chars
+            followOrientation()
             val encoder = createEncoder(config)
             val input = encoder.createInputSurface()
             encoder.start()
@@ -182,6 +219,7 @@ class VideoStreamer(context: Context) {
                         fail(gen, "Камера отклонила запрос: ${e.message}")
                         return
                     }
+                    rotation = frameRotation(chars)
                     listener?.onVideoStarted(startedInfo(config, fpsRange))
                 }
 
@@ -208,6 +246,54 @@ class VideoStreamer(context: Context) {
                 "timestamp_source",
                 if (source == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) "realtime" else "monotonic",
             )
+            .put("rotation", rotation)
+    }
+
+    /** На сколько повернуть кадр по часовой стрелке, чтобы он стоял прямо относительно экрана. */
+    private fun frameRotation(chars: CameraCharacteristics): Int {
+        val sensor = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val front = chars.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_FRONT
+        return if (front) (sensor + screenRotation) % 360 else (sensor - screenRotation + 360) % 360
+    }
+
+    /** Закреплённая ориентация — сразу её поворот; «как повёрнут телефон» — начинаем с экрана и слушаем датчик. */
+    private fun followOrientation() {
+        val fixed = when (orientation) {
+            "portrait" -> 0
+            "landscape" -> 90
+            "reverse_portrait" -> 180
+            "reverse_landscape" -> 270
+            else -> null
+        }
+        followTilt = fixed == null
+        if (fixed != null) {
+            tilt.disable()
+            screenRotation = fixed
+        } else {
+            screenRotation = (displays.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: Surface.ROTATION_0) * 90
+            tilt.enable()
+        }
+    }
+
+    /** `degrees` — поворот телефона по часовой стрелке; экран поворачивается в обратную сторону. */
+    private fun onTilt(degrees: Int) {
+        if (session == null || !followTilt) return
+        // Ближайшее из 0/90/180/270, но с запасом: у границы в 45° поворот не прыгает туда-обратно.
+        val current = (360 - screenRotation) % 360
+        if (abs((degrees - current + 540) % 360 - 180) < 60) return
+        screenRotation = (360 - (degrees + 45) / 90 % 4 * 90) % 360
+        updateRotation()
+    }
+
+    private fun updateRotation() {
+        // Видео ещё запускается — поворот уйдёт вместе с video_started.
+        val chars = characteristics ?: return
+        if (session == null) return
+        val next = frameRotation(chars)
+        if (next != rotation) {
+            rotation = next
+            listener?.onVideoRotation(next)
+        }
     }
 
     private fun applyRequest() {
@@ -231,6 +317,7 @@ class VideoStreamer(context: Context) {
 
     private fun stopInternal() {
         generation++
+        tilt.disable()
         try {
             session?.close()
         } catch (_: Exception) {

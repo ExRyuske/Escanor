@@ -1,4 +1,4 @@
-# Протокол Escanor v6
+# Протокол Escanor v7
 
 Телефон слушает `127.0.0.1:27183`, ПК подключается через `adb forward tcp:27183 tcp:27183`.
 ПК открывает три TCP-соединения; первый байт каждого — номер канала:
@@ -34,6 +34,7 @@ u32 size | u8 flags | i64 pts_us | payload[size]
 | `ping` | `t` — время ПК, мкс |
 | `start_video` | `camera`, `physical`, `width`, `height`, `fps`, `bitrate` (видео всегда H.264) |
 | `stop_video`, `request_keyframe` | — |
+| `video_orientation` | `orientation` — как у `macropad`; по ней поворачиваются кадры камеры, даже когда макропад не показан |
 | `set_controls` | любые из: `zoom`, `ev`, `focus` (`continuous`/`manual`), `focus_distance`, `white_balance`, `torch`, `stabilization`, `ae_lock`, `awb_lock` |
 | `start_audio` | `device` (id или null), `source`, `channels` |
 | `stop_audio` | — |
@@ -42,8 +43,14 @@ u32 size | u8 flags | i64 pts_us | payload[size]
 | `macropad_off` | — |
 
 Телефон → ПК: `hello {version, phone}`, `devices {cameras, microphones, audio_sources}`,
-`pong {t, realtime_us, monotonic_us}`, `channel {channel}`, `video_started`, `video_stopped`,
-`video_error {message}`, `audio_started {sample_rate, channels, device}`, `audio_stopped`,
+`pong {t, realtime_us, monotonic_us}`, `channel {channel}`,
+`video_started {camera, physical, width, height, fps, encoder, timestamp_source, rotation}`,
+`video_rotation {rotation}` (поворот изменился), `video_stopped`, `video_error {message}`, `audio_started {sample_rate, channels, device}`, `audio_stopped`,
 `audio_error {message}`, `macropad_press {page, id, down}` (кнопка нажата/отпущена; папки и «Назад» телефон открывает сам), `error {message}`.
+
+`rotation` — на сколько градусов по часовой стрелке (0, 90, 180, 270) ПК поворачивает кадры, чтобы
+изображение стояло прямо так же, как экран макропада: кодировщик выдаёт кадры как их видит сенсор.
+Поворот следует `video_orientation`: закреплённая ориентация — постоянный поворот, `auto` — по датчику
+(без учёта блокировки поворота); `video_rotation` приходит при каждой смене.
 
 Задержка «сенсор → ПК» считается по смещению часов, полученному из `ping`/`pong` с минимальным RTT.

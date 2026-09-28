@@ -6,7 +6,7 @@ use crate::protocol::{FLAG_CONFIG, FLAG_KEYFRAME, read_packet};
 use crate::vcam::FrameOutput;
 use std::io::BufReader;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -71,6 +71,8 @@ pub struct VideoShared {
     pub clock: Arc<ClockOffsets>,
     /// Часы, которыми телефон подписывает кадры (см. `timestamp_source`).
     pub realtime_timestamps: AtomicBool,
+    /// На сколько градусов по часовой стрелке поворачивать кадры: телефон считает его по ориентации макропада.
+    pub rotation: AtomicU32,
     pub preview: AtomicBool,
     pub output: Arc<FrameOutput>,
     /// Какой декодер сейчас работает (для интерфейса).
@@ -128,6 +130,7 @@ fn run(
     let mut waiting_keyframe = true;
     let mut last_keyframe_request: Option<Instant> = None;
     let mut last_preview = Instant::now() - PREVIEW_INTERVAL;
+    let mut rotated = Vec::new();
 
     let ask_keyframe = |last: &mut Option<Instant>| {
         if last.is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_INTERVAL) {
@@ -175,6 +178,15 @@ fn run(
         let result = decoder.decode(&packet, pts, &mut |frame| {
             let handling_started = Instant::now();
             decoded += 1;
+            // Кодировщик телефона поворачивать не умеет — кадр поворачивается здесь.
+            let turned;
+            let frame = match shared.rotation.load(Ordering::Relaxed) {
+                degrees @ (90 | 180 | 270) => {
+                    turned = frame.rotated(degrees, &mut rotated);
+                    &turned
+                }
+                _ => frame,
+            };
             shared.output.write(frame);
             // Задержка «сенсор → кадр готов для виртуальной камеры».
             if let Some(latency) = shared.clock.latency_us(clock, pts) {

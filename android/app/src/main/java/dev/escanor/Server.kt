@@ -186,6 +186,7 @@ class Session(
             }
             "request_keyframe" -> video.requestKeyframe()
             "set_controls" -> video.setControls(msg)
+            "video_orientation" -> video.setOrientation(msg.getString("orientation"))
             "start_audio" -> {
                 val out = audioOut ?: return send(error("Аудиоканал не подключён"))
                 audio.start(AudioConfig.fromJson(msg), out, this)
@@ -204,6 +205,10 @@ class Session(
     override fun onVideoStarted(info: JSONObject) {
         send(info.put("type", "video_started"))
         Status.set("Передаётся видео ${info.getInt("width")}×${info.getInt("height")} @ ${info.getInt("fps")}")
+    }
+
+    override fun onVideoRotation(rotation: Int) {
+        send(JSONObject().put("type", "video_rotation").put("rotation", rotation))
     }
 
     override fun onVideoError(message: String) {

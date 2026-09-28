@@ -7,7 +7,7 @@ import java.nio.ByteBuffer
 /** Константы протокола. Описание формата — docs/protocol.md. */
 object Protocol {
     const val PORT = 27183
-    const val VERSION = 6
+    const val VERSION = 7
 
     const val CHANNEL_CONTROL = 1
     const val CHANNEL_VIDEO = 2

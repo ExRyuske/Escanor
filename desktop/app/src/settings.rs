@@ -116,7 +116,28 @@ impl MacropadSettings {
     /// Число кнопок на каждой странице (и в каждой папке) равно размеру сетки;
     /// лишние отбрасываются, новые пустые.
     pub fn resize(&mut self) {
-        resize_page(&mut self.buttons, (self.columns * self.rows) as usize);
+        self.set_grid(self.columns, self.rows);
+    }
+
+    /// Меняет размер сетки. Кнопки на каждой странице остаются в своих строке и столбце:
+    /// кнопки хранятся по строкам, и без пересчёта новый столбец сдвигал бы всё, что после него.
+    pub fn set_grid(&mut self, columns: u32, rows: u32) {
+        let from = self.columns as usize;
+        self.columns = columns;
+        self.rows = rows;
+        resize_page(&mut self.buttons, from, columns as usize, (columns * rows) as usize);
+    }
+
+    /// Помещаются ли все кнопки, включая лежащие в папках, в сетку такого размера.
+    pub fn fits_grid(&self, columns: u32, rows: u32) -> bool {
+        fn blank(b: &ButtonSettings) -> bool {
+            b.is_empty() && b.children.iter().all(blank)
+        }
+        fn fits(buttons: &[ButtonSettings], inside: &dyn Fn(usize) -> bool) -> bool {
+            buttons.iter().enumerate().all(|(i, b)| if inside(i) { fits(&b.children, inside) } else { blank(b) })
+        }
+        let (from, columns, rows) = (self.columns as usize, columns as usize, rows as usize);
+        fits(&self.buttons, &|i| i % from < columns && i / from < rows)
     }
 
     /// Все кнопки, включая лежащие в папках.
@@ -158,12 +179,24 @@ impl MacropadSettings {
 /// В папке первая ячейка — «Назад»: её место занято, кнопку туда не положить.
 pub const BACK_SLOT: usize = 0;
 
-fn resize_page(buttons: &mut Vec<ButtonSettings>, count: usize) {
+/// Подгоняет страницу из сетки в `from` столбцов под сетку в `columns` столбцов и `count` ячеек.
+fn resize_page(buttons: &mut Vec<ButtonSettings>, from: usize, columns: usize, count: usize) {
+    if from != columns {
+        let old = std::mem::take(buttons);
+        buttons.resize(count, ButtonSettings::default());
+        for (i, b) in old.into_iter().enumerate() {
+            let (row, column) = (i / from, i % from);
+            if column < columns && row * columns + column < count {
+                buttons[row * columns + column] = b;
+            }
+        }
+    }
     buttons.resize(count, ButtonSettings::default());
     for b in buttons {
         b.normalize();
-        if b.folder {
-            resize_page(&mut b.children, count);
+        // Содержимое папки, которая на время стала обычной кнопкой, тоже следует сетке.
+        if b.folder || !b.children.is_empty() {
+            resize_page(&mut b.children, from, columns, count);
         }
     }
 }
@@ -447,6 +480,41 @@ mod tests {
         assert_eq!(pad.buttons[2].children.len(), 4, "папка следует размеру сетки");
         assert_eq!(pad.images(), ["inside.png"], "картинки из папок не считаются лишними");
         assert_eq!(pad.page(&[2])[3].states[0].image.as_deref(), Some("inside.png"));
+    }
+
+    #[test]
+    fn buttons_keep_row_and_column_when_grid_changes() {
+        let mut pad = MacropadSettings::default();
+        // 3×2: A B C / D E F.
+        for (b, label) in pad.buttons.iter_mut().zip(["A", "B", "C", "D", "E", "F"]) {
+            b.states[0].label = label.into();
+        }
+        pad.buttons[5].folder = true;
+        pad.resize();
+        pad.buttons[5].children[4].states[0].label = "inner".into();
+        let labels = |page: &[ButtonSettings]| page.iter().map(|b| b.states[0].label.clone()).collect::<Vec<_>>();
+
+        pad.set_grid(4, 2);
+        assert_eq!(labels(&pad.buttons), ["A", "B", "C", "", "D", "E", "F", ""]);
+        assert_eq!(pad.page(&[6])[5].states[0].label, "inner", "в папке — тоже по строке и столбцу");
+
+        pad.set_grid(4, 3);
+        assert_eq!(labels(&pad.buttons)[..8], ["A", "B", "C", "", "D", "E", "F", ""]);
+        pad.set_grid(3, 2);
+        assert_eq!(labels(&pad.buttons), ["A", "B", "C", "D", "E", "F"]);
+    }
+
+    #[test]
+    fn grid_does_not_shrink_over_buttons() {
+        let mut pad = MacropadSettings::default();
+        pad.buttons[2].keys.ctrl = true;
+        assert!(!pad.fits_grid(2, 2), "в последнем столбце кнопка");
+        assert!(pad.fits_grid(3, 1));
+        pad.buttons[0].folder = true;
+        pad.resize();
+        pad.buttons[0].children[4].states[0].label = "x".into();
+        assert!(!pad.fits_grid(3, 1), "кнопка во второй строке папки");
+        assert!(pad.fits_grid(4, 3));
     }
 
     #[test]

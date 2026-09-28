@@ -8,7 +8,7 @@ use escanor_core::video::{self, VideoCallbacks, VideoShared, VideoStats};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -77,6 +77,7 @@ fn decodes_phone_like_stream() {
         stats: VideoStats::default(),
         clock: Arc::new(ClockOffsets::default()),
         realtime_timestamps: AtomicBool::new(true),
+        rotation: AtomicU32::new(0),
         preview: AtomicBool::new(true),
         output: Arc::new(FrameOutput::default()),
         decoder: Mutex::new(None),

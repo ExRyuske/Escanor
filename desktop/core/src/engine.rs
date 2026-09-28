@@ -7,7 +7,7 @@ use crate::adb::{self, Adb, AdbDevice, find_apk};
 use crate::audio::{self, AudioOutput, AudioOutputInfo, AudioRing, SharedRing};
 use crate::clock::{ClockOffsets, ClockSync, now_us};
 use crate::keys;
-use crate::macropad::{PadKind, PadLayout, SoundRef};
+use crate::macropad::{Orientation, PadKind, PadLayout, SoundRef};
 use crate::protocol::{
     AudioParams, AudioStarted, CHANNEL_AUDIO, CHANNEL_CONTROL, CHANNEL_VIDEO, Controls, Devices, MacropadButton,
     MacropadLayout, MacropadPage, MacropadState, PHONE_PORT, PhoneInfo, Request, Response, VERSION, VideoParams,
@@ -21,7 +21,7 @@ use base64::Engine as _;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,8 @@ pub enum Command {
     SetAudio(Option<AudioParams>),
     /// Изменения настроек камеры (накладываются на текущие).
     SetControls(Controls),
+    /// Ориентация макропада — по ней поворачиваются кадры камеры.
+    SetOrientation(Orientation),
     /// Устройство вывода звука (id из `AudioOutputs`); `None` — по умолчанию.
     SetAudioOutput(Option<String>),
     SetPreview(bool),
@@ -191,6 +193,7 @@ struct Engine {
     desired_video: Option<VideoParams>,
     desired_audio: Option<AudioParams>,
     controls: Controls,
+    orientation: Orientation,
     audio_output_id: Option<String>,
 
     clock: Arc<ClockOffsets>,
@@ -229,6 +232,7 @@ impl Engine {
             stats: VideoStats::default(),
             clock: clock.clone(),
             realtime_timestamps: AtomicBool::new(true),
+            rotation: AtomicU32::new(0),
             preview: AtomicBool::new(true),
             output: Arc::new(FrameOutput::default()),
             decoder: Mutex::new(None),
@@ -250,6 +254,7 @@ impl Engine {
             desired_video: None,
             desired_audio: None,
             controls: Controls::default(),
+            orientation: Orientation::default(),
             audio_output_id: None,
             clock,
             clock_sync: ClockSync::default(),
@@ -388,6 +393,12 @@ impl Engine {
             Command::SetControls(changes) => {
                 self.controls.merge(&changes);
                 self.send(Request::SetControls(changes));
+            }
+            Command::SetOrientation(orientation) => {
+                if orientation != self.orientation {
+                    self.orientation = orientation;
+                    self.send(Request::VideoOrientation { orientation });
+                }
             }
             Command::SetAudioOutput(id) => {
                 if id != self.audio_output_id {
@@ -550,6 +561,8 @@ impl Engine {
         self.emit(Event::Connected { serial: c.serial, phone: c.phone, devices: c.devices });
         self.send(Request::Ping { t: now_us() });
         self.last_ping = Instant::now();
+        // До запуска видео: иначе первые кадры ушли бы с поворотом по умолчанию.
+        self.send(Request::VideoOrientation { orientation: self.orientation });
         self.restore_desired_state();
         self.send_macropad();
     }
@@ -581,8 +594,10 @@ impl Engine {
             }
             Response::VideoStarted(info) => {
                 self.video.realtime_timestamps.store(info.timestamp_source == "realtime", Ordering::Relaxed);
+                self.video.rotation.store(info.rotation, Ordering::Relaxed);
                 self.emit(Event::VideoStarted(info));
             }
+            Response::VideoRotation { rotation } => self.video.rotation.store(rotation, Ordering::Relaxed),
             Response::VideoStopped => self.emit(Event::VideoStopped),
             Response::VideoError { message } => {
                 // Не пытаемся бесконечно запускать то, что телефон не может.

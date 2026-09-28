@@ -22,6 +22,11 @@ const SMALL: u32 = 13;
 /// Основной текст: подписи переключателей, списки, поля ввода.
 const BODY: u32 = 14;
 const PAD_CELL: f32 = 116.0;
+const PAD_GAP: f32 = 10.0;
+/// Толщина кнопок размера у краёв сетки.
+const PAD_EDGE: f32 = 28.0;
+/// Больше столбцов или строк на экране телефона не помещается.
+const PAD_MAX: u32 = 6;
 const BOLD: Font = Font { weight: Weight::Semibold, ..Font::DEFAULT };
 
 pub fn view(app: &App) -> Element<'_, Message> {
@@ -510,18 +515,79 @@ fn audio_group(app: &App) -> Element<'_, Message> {
 
 // --- Макропад ---
 
-fn stepper<'a>(value: u32, on: fn(u32) -> Message) -> Element<'a, Message> {
-    let step = |label: &'a str, next: u32, enabled: bool| {
-        button(text(label).size(14).center()).width(28).style(style::btn).on_press_maybe(enabled.then(|| on(next)))
+/// Кнопка у края сетки, меняющая её размер; подсказка объясняет, что она делает или почему недоступна.
+fn grid_edge<'a>(
+    label: &'a str,
+    tip: &'a str,
+    on_press: Option<Message>,
+    width: impl Into<Length>,
+    height: impl Into<Length>,
+) -> Element<'a, Message> {
+    tooltip(
+        button(container(text(label).size(16)).center(Length::Fill))
+            .padding(0)
+            .width(width)
+            .height(height)
+            .style(style::btn)
+            .on_press_maybe(on_press),
+        container(text(tip).size(SMALL)).padding([8, 12]).max_width(320).style(style::tooltip),
+        tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .into()
+}
+
+/// Сетка с кнопками размера у краёв: справа — столбцы, снизу — строки.
+fn resizable_grid<'a>(app: &App, grid: Element<'a, Message>) -> Element<'a, Message> {
+    let pad = &app.pad;
+    let (columns, rows) = (pad.columns, pad.rows);
+    let span = |cells: u32| cells as f32 * PAD_CELL + cells.saturating_sub(1) as f32 * PAD_GAP;
+    let grow = |cells: u32, add: &'a str, full: &'a str| {
+        if cells < PAD_MAX { (add, Some(cells + 1)) } else { (full, None) }
     };
-    row![
-        step("−", value.saturating_sub(1), value > 1),
-        text(value).size(15).width(24).center(),
-        step("+", value + 1, value < 6)
+    let shrink = |cells: u32, fits: bool, remove: &'a str, busy: &'a str, last: &'a str| {
+        if cells <= 1 {
+            (last, None)
+        } else if fits {
+            (remove, Some(cells - 1))
+        } else {
+            (busy, None)
+        }
+    };
+
+    let (add_tip, add) = grow(columns, "Добавить столбец справа", "Больше столбцов не поместится на экране телефона");
+    let (remove_tip, remove) = shrink(
+        columns,
+        pad.fits_grid(columns - 1, rows),
+        "Убрать правый столбец",
+        "Правый столбец не пустой — сначала перетащите или очистите кнопки в нём, в том числе в папках",
+        "Нужен хотя бы один столбец",
+    );
+    let side = column![
+        grid_edge("+", add_tip, add.map(Message::PadColumns), PAD_EDGE, Length::Fill),
+        grid_edge("−", remove_tip, remove.map(Message::PadColumns), PAD_EDGE, PAD_EDGE),
     ]
     .spacing(4)
-    .align_y(Alignment::Center)
-    .into()
+    .height(span(rows));
+
+    let (add_tip, add) = grow(rows, "Добавить строку снизу", "Больше строк не поместится на экране телефона");
+    let (remove_tip, remove) = shrink(
+        rows,
+        pad.fits_grid(columns, rows - 1),
+        "Убрать нижнюю строку",
+        "Нижняя строка не пустая — сначала перетащите или очистите кнопки в ней, в том числе в папках",
+        "Нужна хотя бы одна строка",
+    );
+    let bottom = row![
+        grid_edge("+", add_tip, add.map(Message::PadRows), Length::Fill, PAD_EDGE),
+        grid_edge("−", remove_tip, remove.map(Message::PadRows), PAD_EDGE, PAD_EDGE),
+    ]
+    .spacing(4)
+    .width(span(columns));
+    let size =
+        text(format!("{columns}×{rows}")).size(SMALL).style(style::muted).width(PAD_EDGE).height(PAD_EDGE).center();
+
+    column![row![grid, side].spacing(PAD_GAP), row![bottom, size].spacing(PAD_GAP)].spacing(PAD_GAP).into()
 }
 
 fn macropad_view(app: &App) -> Element<'_, Message> {
@@ -531,10 +597,6 @@ fn macropad_view(app: &App) -> Element<'_, Message> {
     let phone = row![
         switch("На телефоне", pad.enabled, Message::PadEnabled),
         space::horizontal(),
-        label("Сетка"),
-        stepper(pad.columns, Message::PadColumns),
-        text("×").size(BODY).style(style::muted),
-        stepper(pad.rows, Message::PadRows),
         select(Orientation::ALL, Some(pad.orientation), Message::PadOrientation).width(180),
     ]
     .spacing(8)
@@ -597,13 +659,14 @@ fn macropad_view(app: &App) -> Element<'_, Message> {
     crumbs = crumbs.push(info(
         "Перетаскивайте кнопки мышью: на другую — поменять местами, на папку — положить внутрь, \
          на «← Назад» — перенести на уровень выше. Папка открывается двойным щелчком. \
-         Программу или звук можно перетащить из Проводника прямо на ячейку.",
+         Программу или звук можно перетащить из Проводника прямо на ячейку. \
+         «+» и «−» справа от сетки добавляют и убирают столбец, снизу — строку.",
     ));
 
     let page = app.pad_page();
-    let mut grid = column![].spacing(10);
+    let mut grid = column![].spacing(PAD_GAP);
     for r in 0..pad.rows as usize {
-        let mut line = row![].spacing(10);
+        let mut line = row![].spacing(PAD_GAP);
         for c in 0..pad.columns as usize {
             let index = r * pad.columns as usize + c;
             if index < page.len() {
@@ -614,6 +677,7 @@ fn macropad_view(app: &App) -> Element<'_, Message> {
     }
     // Отпустили мышь мимо ячеек или увели курсор с сетки — перетаскивание отменяется.
     let grid = mouse_area(grid).on_release(Message::PadDragCancel).on_exit(Message::PadDragCancel);
+    let grid = resizable_grid(app, grid.into());
 
     let main = column![panel(toolbar), crumbs, container(grid).center_x(Length::Fill)].spacing(16).padding(24);
 
@@ -830,7 +894,7 @@ fn sound_trim<'a>(app: &App, b: &ButtonSettings) -> Option<Element<'a, Message>>
                     .style(style::btn_link)
                     .on_press_maybe(trimmed.then_some(Message::PadTrimReset)),
                 space::horizontal(),
-                button(text("▶ Прослушать").size(SMALL).wrapping(text::Wrapping::None))
+                button(text("Прослушать").size(SMALL).wrapping(text::Wrapping::None))
                     .style(style::btn_primary)
                     .on_press(Message::PadPreviewSound),
             ]
